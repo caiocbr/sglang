@@ -536,12 +536,18 @@ class Qwen3MoeAttention(nn.Module):
         )
         self._used_fused_qk_norm_rope_last_call = False
 
+        sliding_window_size = (
+            getattr(config, "sliding_window", None)
+            if config is not None and getattr(config, "use_sliding_window", False)
+            else None
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
             prefix=add_prefix("attn", prefix),
         )
 
