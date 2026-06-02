@@ -1112,6 +1112,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    def get_attention_sliding_window_size(self):
+        """Get the sliding window size for attention layers.
+        
+        Required for proper Sliding Window Attention (SWA) initialization.
+        Returns the sliding_window value from config if use_sliding_window is True,
+        None otherwise.
+        """
+        if getattr(self.config, "use_sliding_window", False):
+            return getattr(self.config, "sliding_window", None)
+        return None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
