@@ -46,6 +46,7 @@ class PyMscclppCommunicator:
         dsl_algos_config = []
         n_nodes = self.world_size // self.nranks_per_node
         if n_nodes == 2 or n_nodes == 4 or n_nodes == 8:
+
             for tbg in [1, 2, 4, 8]:
                 for num_threads_per_block in [256, 512, 768, 1024]:
                     spec = self.mscclpp.language.AlgoSpec(
