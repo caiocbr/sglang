@@ -28,6 +28,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_mscclpp_mode,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
@@ -143,6 +144,38 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+        )
+    elif a2a_backend.is_mscclpp():
+        # Single ``mscclpp`` a2a backend, two transport modes (mirrors DeepEP):
+        #   normal       -> high-throughput intranode (NVLink) dispatcher
+        #   low_latency  -> low-latency (LL) dispatcher
+        if get_mscclpp_mode().is_low_latency():
+            from sglang.srt.environ import envs
+            from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+                MSCCLPPLLDispatcher,
+            )
+
+            return MSCCLPPLLDispatcher(
+                group=get_tp_group().device_group,
+                router_topk=moe_runner_config.top_k,
+                num_experts=moe_runner_config.num_experts,
+                num_local_experts=moe_runner_config.num_local_experts,
+                hidden_size=moe_runner_config.hidden_size,
+                params_dtype=moe_runner_config.params_dtype,
+                num_max_dispatch_tokens_per_rank=(
+                    envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                ),
+            )
+
+        from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPDispatcher
+
+        return MSCCLPPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")

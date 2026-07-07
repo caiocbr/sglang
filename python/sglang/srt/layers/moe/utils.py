@@ -37,6 +37,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
+    MSCCLPP = "mscclpp"
 
     @classmethod
     def _missing_(cls, value):
@@ -76,6 +77,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_mscclpp(self):
+        return self == MoeA2ABackend.MSCCLPP
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -197,7 +201,26 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
-class DispatcherOutputDtype(Enum):
+class MSCCLPPMode(Enum):
+    """Transport mode for the single ``mscclpp`` MoE a2a backend.
+
+    Mirrors DeepEP's two-mode design (``deepep`` backend + ``deepep_mode``):
+    one ``mscclpp`` a2a backend that runs either the high-throughput intranode
+    (``normal``) dispatcher or the low-latency (``low_latency``) dispatcher,
+    selected here instead of via separate a2a backends.
+    """
+
+    NORMAL = "normal"
+    LOW_LATENCY = "low_latency"
+
+    def is_normal(self) -> bool:
+        return self == MSCCLPPMode.NORMAL
+
+    def is_low_latency(self) -> bool:
+        return self == MSCCLPPMode.LOW_LATENCY
+
+
+class DeepEPOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
 
@@ -268,28 +291,37 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     return DispatcherOutputDtype.FP8
 
 
-def get_ascend_dispatcher_output_dtype(dispatcher):
-    """
-    Automatically choose the dispatch output dtype for Ascend.
-    """
-
-    # 1. Parse quant config to determine the output dtype of dispatcher
-    if dispatcher.quant_config is not None:
-        dispatcher_output_dtype = dispatcher.quant_config.get(
-            "dispatcher_output_dtype", None
-        )
-        if dispatcher_output_dtype is not None:
-            return DispatcherOutputDtype(dispatcher_output_dtype)
-
-    # 2. Ascend dispatch defaults to BF16
-    return DispatcherOutputDtype.BF16
+MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+DEEPEP_MODE: Optional[DeepEPMode] = None
+MSCCLPP_MODE: Optional[MSCCLPPMode] = None
+IS_TBO_ENABLED: Optional[bool] = None
+IS_SBO_ENABLED: Optional[bool] = None
+TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
+DEEPEP_CONFIG: Optional[str] = None
+DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MOE_QUANTIZATION: Optional[str] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
-    moe = get_flags().moe
-    moe.a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
-    moe.runner_backend = MoeRunnerBackend(server_args.moe_runner_backend)
-    moe.speculative_runner_backend = (
+    global MOE_A2A_BACKEND
+    global MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_A2A_BACKEND
+    global DEEPEP_MODE
+    global MSCCLPP_MODE
+    global DEEPEP_CONFIG
+    global IS_TBO_ENABLED
+    global IS_SBO_ENABLED
+    global TBO_TOKEN_DISTRIBUTION_THRESHOLD
+    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global MOE_QUANTIZATION
+
+    MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
+    MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
         else moe.runner_backend
@@ -299,11 +331,13 @@ def initialize_moe_config(server_args: ServerArgs):
         if server_args.speculative_moe_a2a_backend is not None
         else moe.a2a_backend
     )
-    moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
-    moe.deepep_config = server_args.deepep_config or ""
-    moe.tbo_enabled = server_args.enable_two_batch_overlap
-    moe.sbo_enabled = server_args.enable_single_batch_overlap
-    if moe.sbo_enabled and is_cuda():
+
+    DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
+    MSCCLPP_MODE = MSCCLPPMode(server_args.mscclpp_mode)
+    DEEPEP_CONFIG = server_args.deepep_config or ""
+    IS_TBO_ENABLED = server_args.enable_two_batch_overlap
+    IS_SBO_ENABLED = server_args.enable_single_batch_overlap
+    if IS_SBO_ENABLED and torch.cuda.is_available():
         if torch.cuda.get_device_capability()[0] == 9:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
@@ -353,6 +387,14 @@ def get_deepep_mode() -> DeepEPMode:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
         moe.deepep_mode = DeepEPMode.AUTO
     return moe.deepep_mode
+
+
+def get_mscclpp_mode() -> MSCCLPPMode:
+    global MSCCLPP_MODE
+    if MSCCLPP_MODE is None:
+        logger.warning("MSCCLPP_MODE is not initialized, using normal mode")
+        MSCCLPP_MODE = MSCCLPPMode.NORMAL
+    return MSCCLPP_MODE
 
 
 def get_deepep_config() -> str:

@@ -276,6 +276,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer",
     "megamoe",
     "ascend_tp",
+    "mscclpp",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -1878,28 +1879,42 @@ class ServerArgs:
     ] = None
 
     # Speculative decoding (ngram)
-    # -------------------------------------------------------------------------
-    speculative_ngram_min_bfs_breadth: A[
-        int,
-        "The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
-    ] = 1
-    speculative_ngram_max_bfs_breadth: A[
-        int,
-        "The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
-    ] = 10
-    speculative_ngram_match_type: A[
-        Literal["BFS", "PROB"],
-        "The match type for cache tree.",
-    ] = "BFS"
-    speculative_ngram_max_trie_depth: A[
-        int,
-        "The max trie depth for ngram speculative decoding.",
-    ] = 18
-    speculative_ngram_capacity: A[
-        int,
-        "The cache capacity for ngram speculative decoding.",
-    ] = (
-        10 * 1000 * 1000
+    speculative_ngram_min_bfs_breadth: int = 1
+    speculative_ngram_max_bfs_breadth: int = 10
+    speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+    speculative_ngram_max_trie_depth: int = 18
+    speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_external_corpus_path: Optional[str] = None
+    speculative_ngram_external_sam_budget: int = 0
+    speculative_ngram_external_corpus_max_tokens: int = 10000000
+    enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
+
+    # Expert parallelism
+    ep_size: int = 1
+    moe_a2a_backend: Literal[
+        "none",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "mori",
+        "ascend_fuseep",
+        "flashinfer",
+        "megamoe",
+        "mscclpp",
+    ] = "none"
+    moe_runner_backend: str = "auto"
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    enable_flashinfer_allreduce_fusion: bool = False
+    enforce_disable_flashinfer_allreduce_fusion: bool = False
+    enable_aiter_allreduce_fusion: bool = False
+    deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    mscclpp_mode: Literal["normal", "low_latency"] = "normal"
+    deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
+        "auto"
     )
     speculative_ngram_external_corpus_path: A[
         Optional[str],
@@ -7163,6 +7178,1017 @@ class ServerArgs:
             help=f"Specify the parser for handling tool-call interactions. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
+        )
+        parser.add_argument(
+            "--tool-server",
+            type=str,
+            default=None,
+            help="Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
+        )
+        parser.add_argument(
+            "--sampling-defaults",
+            type=str,
+            choices=["openai", "model"],
+            default=ServerArgs.sampling_defaults,
+            help="Where to get default sampling parameters. "
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
+            "--asr-max-buffer-seconds",
+            type=int,
+            default=ServerArgs.asr_max_buffer_seconds,
+            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
+            "will accumulate before closing the session with a buffer_overflow "
+            "error. Guards against OOM when a client streams audio faster than "
+            "inference can consume it. Default 60s.",
+        )
+        parser.add_argument(
+            "--asr-max-concurrent-sessions",
+            type=int,
+            default=ServerArgs.asr_max_concurrent_sessions,
+            help="Maximum number of concurrent realtime ASR WebSocket sessions "
+            "served by /v1/realtime. New connections beyond this cap are "
+            "accepted, sent an error{code:too_many_sessions} frame, and closed. "
+            "Default 32.",
+        )
+
+        # Data parallelism
+        parser.add_argument(
+            "--data-parallel-size",
+            "--dp-size",
+            type=int,
+            default=ServerArgs.dp_size,
+            help="The data parallelism size.",
+        )
+        parser.add_argument(
+            "--load-balance-method",
+            type=str,
+            default=ServerArgs.load_balance_method,
+            help="The load balancing strategy for data parallelism.",
+            choices=[
+                "auto",
+                "round_robin",
+                "follow_bootstrap_room",
+                "total_requests",
+                "total_tokens",
+            ],
+        )
+        parser.add_argument(
+            "--prefill-round-robin-balance",
+            action=DeprecatedAction,
+            help="Note: --prefill-round-robin-balance is deprecated now.",
+        )
+
+        # Multi-node distributed serving
+        parser.add_argument(
+            "--dist-init-addr",
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
+            type=str,
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+        )
+        parser.add_argument(
+            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+        )
+        parser.add_argument(
+            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
+
+        # Model override args
+        parser.add_argument(
+            "--json-model-override-args",
+            type=str,
+            help="A dictionary in JSON string format used to override default model configurations.",
+            default=ServerArgs.json_model_override_args,
+        )
+        parser.add_argument(
+            "--preferred-sampling-params",
+            type=json.loads,
+            help="json-formatted sampling settings that will be returned in /get_model_info",
+        )
+
+        # LoRA
+        parser.add_argument(
+            "--enable-lora",
+            default=ServerArgs.enable_lora,
+            action="store_true",
+            help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+        )
+        parser.add_argument(
+            "--enable-lora-overlap-loading",
+            default=ServerArgs.enable_lora_overlap_loading,
+            action="store_true",
+            help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, "
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
+        )
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=LoRAPathAction,
+            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--max-loaded-loras",
+            type=int,
+            default=ServerArgs.max_loaded_loras,
+            help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+        )
+        parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default=ServerArgs.lora_eviction_policy,
+            choices=["lru", "fifo"],
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=LORA_BACKEND_CHOICES,
+            default=ServerArgs.lora_backend,
+            help="Choose the kernel backend for multi-LoRA serving.",
+        )
+        parser.add_argument(
+            "--max-lora-chunk-size",
+            type=int,
+            default=ServerArgs.max_lora_chunk_size,
+            choices=[16, 32, 64, 128],
+            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+        )
+        parser.add_argument(
+            "--experts-shared-outer-loras",
+            default=ServerArgs.experts_shared_outer_loras,
+            action=argparse.BooleanOptionalAction,
+            help="Force shared outer LoRA mode for MoE models. "
+            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
+        )
+        parser.add_argument(
+            "--lora-use-virtual-experts",
+            default=ServerArgs.lora_use_virtual_experts,
+            action="store_true",
+            help="Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+        )
+        parser.add_argument(
+            "--lora-strict-loading",
+            default=ServerArgs.lora_strict_loading,
+            action=argparse.BooleanOptionalAction,
+            help="Enable strict loading for LoRA adapters. "
+            "When set, mismatched or missing keys in the adapter weights will raise an error.",
+        )
+        parser.add_argument(
+            "--lora-drain-wait-threshold",
+            type=float,
+            default=ServerArgs.lora_drain_wait_threshold,
+            help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        )
+
+        # Kernel backend
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            choices=ATTENTION_BACKEND_CHOICES,
+            default=ServerArgs.attention_backend,
+            help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--prefill-attention-backend",
+            type=str,
+            choices=ATTENTION_BACKEND_CHOICES,
+            default=ServerArgs.prefill_attention_backend,
+            help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=ATTENTION_BACKEND_CHOICES,
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=SAMPLING_BACKEND_CHOICES,
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=GRAMMAR_BACKEND_CHOICES,
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--radix-cache-backend",
+            type=str,
+            default=ServerArgs.radix_cache_backend,
+            help=(
+                "Name of a radix-cache backend previously registered via "
+                "register_radix_cache_backend. Omit this flag to use the "
+                "built-in default cache selection chain."
+            ),
+        )
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=[
+                "sdpa",
+                "fa3",
+                "fa4",
+                "triton_attn",
+                "ascend_attn",
+                "aiter_attn",
+                "flashinfer_cudnn",
+                "amx_attn",
+            ],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
+        parser.add_argument(
+            "--dsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            default=ServerArgs.dsa_prefill_backend,
+            type=str,
+            choices=DSA_CHOICES,
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-prefill-backend",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-prefill-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-decode-backend",
+            dest="dsa_decode_backend",
+            default=ServerArgs.dsa_decode_backend,
+            type=str,
+            choices=DSA_CHOICES,
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-decode-backend",
+            dest="dsa_decode_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-decode-backend",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-decode-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-topk-backend",
+            dest="dsa_topk_backend",
+            default=ServerArgs.dsa_topk_backend,
+            type=str,
+            choices=DSA_TOPK_BACKEND_CHOICES,
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. "
+            "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+        )
+        parser.add_argument(
+            "--fp8-gemm-backend",
+            type=str,
+            choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp8_gemm_runner_backend,
+            dest="fp8_gemm_runner_backend",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. "
+            "Options: 'auto' (default, auto-selects based on hardware), "
+            "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
+            "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), "
+            "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
+            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
+            "'triton' (fallback, widely compatible), "
+            "'aiter' (ROCm only). ",
+        )
+        parser.add_argument(
+            "--fp4-gemm-backend",
+            type=str,
+            choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp4_gemm_runner_backend,
+            dest="fp4_gemm_runner_backend",
+            help="Choose the runner backend for NVFP4 GEMM operations. "
+            "Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), "
+            "'cutlass' (SGLang CUTLASS kernel), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
+            "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
+            "'marlin' (weight-only W4A16 fallback for SM80+). ",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-autotune",
+            default=ServerArgs.disable_flashinfer_autotune,
+            action="store_true",
+            help="Disable FlashInfer autotuning.",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            help=(
+                "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
+                "NGRAM, DFLASH. Or any name registered via "
+                "`SpeculativeAlgorithm.register`."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            "--speculative-draft-model",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The specific draft model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-draft-load-format",
+            type=str,
+            default=ServerArgs.speculative_draft_load_format,
+            choices=LOAD_FORMAT_CHOICES,
+            help="The format of the draft model weights to load. "
+            "If not specified, will use the same format as --load-format. "
+            "Use 'dummy' to initialize draft model weights with random values for profiling.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of tokens sampled from the draft model in eagle2 each step.",
+            default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of tokens sampled from the draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+            default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-single",
+            type=float,
+            help="Accept a draft token if its probability in the target model is greater than this threshold.",
+            default=ServerArgs.speculative_accept_threshold_single,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-acc",
+            type=float,
+            help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
+            default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-token-map",
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-attention-mode",
+            type=str,
+            choices=["prefill", "decode"],
+            help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
+            default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--speculative-draft-attention-backend",
+            type=str,
+            help="Attention backend for speculative decoding drafting.",
+            default=ServerArgs.speculative_draft_attention_backend,
+        )
+        parser.add_argument(
+            "--speculative-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            help="Sliding window size for the draft model. Honored by Llama EAGLE-3 "
+            "(`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. "
+            "MLA-based drafters) silently ignore it. "
+            "For Llama EAGLE-3, the drafter only attends to the most recent N keys "
+            "(verifier hidden states + its own outputs); the verifier is unaffected. "
+            "For DFLASH, the draft worker keeps a recent target-token window in its "
+            "local KV cache (paged backends may retain up to one extra page on the "
+            "left for alignment). Default is full attention/context.",
+            default=ServerArgs.speculative_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--speculative-draft-window-size",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-moe-a2a-backend",
+            type=str,
+            choices=MOE_A2A_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_a2a_backend,
+            help="Choose the backend for MoE A2A in speculative decoding",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-quantization",
+            type=str,
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            default=ServerArgs.speculative_draft_model_quantization,
+            help="The quantization method for speculative model.",
+        )
+
+        # Speculative decoding (ngram)
+        parser.add_argument(
+            "--speculative-ngram-min-bfs-breadth",
+            type=int,
+            default=ServerArgs.speculative_ngram_min_bfs_breadth,
+            help="The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-bfs-breadth",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_bfs_breadth,
+            help="The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-match-type",
+            type=str,
+            choices=["BFS", "PROB"],
+            default=ServerArgs.speculative_ngram_match_type,
+            help="The match type for cache tree.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-trie-depth",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_trie_depth,
+            help="The max trie depth for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-capacity",
+            type=int,
+            default=ServerArgs.speculative_ngram_capacity,
+            help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_external_corpus_path,
+            help="Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-sam-budget",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_sam_budget,
+            help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-max-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        )
+        parser.add_argument(
+            "--speculative-adaptive",
+            action="store_true",
+            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+            default=ServerArgs.speculative_adaptive,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-config",
+            type=str,
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+            default=ServerArgs.speculative_adaptive_config,
+        )
+        parser.add_argument(
+            "--speculative-skip-dp-mlp-sync",
+            action="store_true",
+            default=ServerArgs.speculative_skip_dp_mlp_sync,
+            help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
+            "when speculative decoding + DP attention are both enabled.",
+        )
+
+        # Multi-layer Eagle speculative decoding
+        parser.add_argument(
+            "--enable-multi-layer-eagle",
+            action="store_true",
+            help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            "--ep",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
+        )
+        parser.add_argument(
+            "--moe-a2a-backend",
+            type=str,
+            choices=MOE_A2A_BACKEND_CHOICES,
+            default=ServerArgs.moe_a2a_backend,
+            help="Choose the backend for MoE A2A.",
+        )
+        parser.add_argument(
+            "--moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.moe_runner_backend,
+            help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--flashinfer-mxfp4-moe-precision",
+            type=str,
+            choices=["default", "bf16"],
+            default=ServerArgs.flashinfer_mxfp4_moe_precision,
+            help="Choose the computation precision of flashinfer mxfp4 moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enforce-disable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enforce disable FlashInfer allreduce fusion.",
+        )
+        parser.add_argument(
+            "--enable-aiter-allreduce-fusion",
+            action="store_true",
+            help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
+            "--deepep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            default="auto",
+            help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--mscclpp-mode",
+            type=str,
+            choices=["normal", "low_latency"],
+            default=ServerArgs.mscclpp_mode,
+            help="Transport mode for the `mscclpp` MoE a2a backend: `normal` "
+            "(high-throughput intranode) or `low_latency`. Ignored unless "
+            "--moe-a2a-backend mscclpp.",
+        )
+        parser.add_argument(
+            "--deepep-dispatcher-output-dtype",
+            type=str,
+            choices=["auto", "bf16", "fp8", "int8", "nvfp4"],
+            default="auto",
+            help="Select DeepEP dispatcher output dtype",
+        )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-algorithm",
+            type=str,
+            default=ServerArgs.eplb_algorithm,
+            help="Chosen EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-min-rebalancing-utilization-threshold",
+            type=float,
+            default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
+            help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-mode",
+            type=str,
+            default=ServerArgs.expert_distribution_recorder_mode,
+            help="Mode of expert distribution recorder.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
+            type=int,
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--deepep-config",
+            type=str,
+            default=ServerArgs.deepep_config,
+            help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+        parser.add_argument(
+            "--elastic-ep-backend",
+            type=str,
+            default=ServerArgs.elastic_ep_backend,
+            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
+        )
+        parser.add_argument(
+            "--enable-elastic-expert-backup",
+            action="store_true",
+            default=ServerArgs.enable_elastic_expert_backup,
+            help="Enable elastic expert backup feature.",
+        )
+        parser.add_argument(
+            "--mooncake-ib-device",
+            type=str,
+            default=ServerArgs.mooncake_ib_device,
+            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+        )
+        parser.add_argument(
+            "--enable-deepep-waterfill",
+            action="store_true",
+            default=ServerArgs.enable_deepep_waterfill,
+            help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
+            "routed expert to the least-loaded EP rank. Automatically sets "
+            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
+            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
+            "or low_latency for production decode so CUDA graph remains enabled. "
+            "Supported on DeepSeek-V3/R1 "
+            "with EP >= 2.",
+        )
+        parser.add_argument(
+            "--elastic-ep-rejoin",
+            action="store_true",
+            default=ServerArgs.elastic_ep_rejoin,
+            help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+        )
+
+        # Mamba Cache
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-dtype",
+            type=str,
+            default=None,
+            choices=["float32", "bfloat16", "float16"],
+            help="The data type of the SSM states in mamba cache. "
+            "If not set, will be read from model config (mamba_ssm_dtype).",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
+        )
+        parser.add_argument(
+            "--mamba-scheduler-strategy",
+            type=str,
+            choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
+            default=ServerArgs.mamba_scheduler_strategy,
+            help="The strategy to use for mamba radix cache.",
+        )
+        parser.add_argument(
+            "--mamba-track-interval",
+            type=int,
+            default=ServerArgs.mamba_track_interval,
+            help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-backend",
+            type=str,
+            choices=MAMBA_BACKEND_CHOICES,
+            default=ServerArgs.mamba_backend,
+            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
+            "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--linear-attn-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_backend,
+            help="The default kernel backend for linear attention (GDN/KDA). "
+            "Can be overridden per-mode by --linear-attn-decode-backend "
+            "and --linear-attn-prefill-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-decode-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_decode_backend,
+            help="Override the kernel backend for linear attention decode. "
+            "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="Override the kernel backend for linear attention prefill/extend. "
+            "If not set, uses --linear-attn-backend.",
+        )
+
+        # Hierarchical cache
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--hicache-ratio",
+            type=float,
+            default=ServerArgs.hicache_ratio,
+            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-size",
+            type=int,
+            default=ServerArgs.hicache_size,
+            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.hicache_write_policy,
+            help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel", "kernel_ascend"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-mem-layout",
+            type=str,
+            choices=[
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_first_kv_split",
+                "page_head",
+            ],
+            default=ServerArgs.hicache_mem_layout,
+            help="The layout of host memory pool for hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend",
+            type=str,
+            choices=[
+                "file",
+                "mooncake",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "simm",
+            ],
+            default=ServerArgs.hicache_storage_backend,
+            help="The storage backend for hierarchical KV cache. "
+            "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
+            "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
+            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+        )
+        parser.add_argument(
+            "--hicache-storage-prefetch-policy",
+            type=str,
+            choices=["best_effort", "wait_complete", "timeout"],
+            default=ServerArgs.hicache_storage_prefetch_policy,
+            help="Control when prefetching from the storage backend should stop.",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.hicache_storage_backend_extra_config,
+            help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # Hierarchical sparse attention
+        parser.add_argument(
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
+        parser.add_argument(
+            "--hisparse-config",
+            "--hierarchical-sparse-attention-extra-config",
+            dest="hisparse_config",
+            type=str,
+            default=ServerArgs.hisparse_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+        )
+
+        # LMCache
+        parser.add_argument(
+            "--enable-lmcache",
+            action="store_true",
+            help="Using LMCache as an alternative hierarchical cache solution",
+        )
+        parser.add_argument(
+            "--lmcache-config-file",
+            type=str,
+            default=ServerArgs.lmcache_config_file,
+            help="Path to the LMCache YAML configuration file",
+        )
+
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+
+        # Diffusion LLM
+        parser.add_argument(
+            "--dllm-algorithm",
+            type=str,
+            default=ServerArgs.dllm_algorithm,
+            help="The diffusion LLM algorithm, such as LowConfidence.",
+        )
+        parser.add_argument(
+            "--dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.dllm_algorithm_config,
+            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+
+        # Offloading
+        parser.add_argument(
+            "--cpu-offload-gb",
+            type=int,
+            default=ServerArgs.cpu_offload_gb,
+            help="How many GBs of RAM to reserve for CPU offloading.",
+        )
+        parser.add_argument(
+            "--offload-group-size",
+            type=int,
+            default=ServerArgs.offload_group_size,
+            help="Number of layers per group in offloading.",
+        )
+        parser.add_argument(
+            "--offload-num-in-group",
+            type=int,
+            default=ServerArgs.offload_num_in_group,
+            help="Number of layers to be offloaded within a group.",
+        )
+        parser.add_argument(
+            "--offload-prefetch-step",
+            type=int,
+            default=ServerArgs.offload_prefetch_step,
+            help="Steps to prefetch in offloading.",
+        )
+        parser.add_argument(
+            "--offload-mode",
+            type=str,
+            default=ServerArgs.offload_mode,
+            help="Mode of offloading.",
+        )
+
+        # Args for multi-item-scoring
+        parser.add_argument(
+            "--enable-mis",
+            action="store_true",
+            default=ServerArgs.enable_mis,
+            help="Enable Multi-Item Scoring optimization. Combines query and multiple items "
+            "into a single sequence for efficient batch processing. "
+            "Requires --attention-backend flashinfer; auto-disables CUDA graph, "
+            "radix cache, and chunked prefill.",
+        )
+
+        # Optimization/debug options
+        parser.add_argument(
+            "--disable-radix-cache",
+            action="store_true",
+            help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["none", "log", "raise"],
+            help=(
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
         )
         parser.add_argument(
             "--kv-canary-real-data",

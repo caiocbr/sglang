@@ -29,6 +29,10 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        MSCCLPPCombineInput,
+        MSCCLPPDispatchOutput,
+        MSCCLPPLLCombineInput,
+        MSCCLPPLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -165,6 +169,18 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_mscclpp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPDispatchOutput]:
+        return dispatch_output.format.is_mscclpp()
+
+    @staticmethod
+    def format_is_mscclpp_ll(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -173,6 +189,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
+    MSCCLPP = "mscclpp"
+    MSCCLPP_LL = "mscclpp_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -194,6 +212,12 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_mscclpp(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP
+
+    def is_mscclpp_ll(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LL
 
 
 @runtime_checkable
@@ -249,6 +273,18 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_mscclpp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP
+
+    @staticmethod
+    def format_is_mscclpp_ll(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LL
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
@@ -256,6 +292,8 @@ class CombineInputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
+    MSCCLPP = "mscclpp"
+    MSCCLPP_LL = "mscclpp_ll"
 
 
 @runtime_checkable

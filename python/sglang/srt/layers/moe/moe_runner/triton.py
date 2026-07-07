@@ -19,6 +19,12 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+        MSCCLPPCombineInput,
+        MSCCLPPDispatchOutput,
+        MSCCLPPLLCombineInput,
+        MSCCLPPLLDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -314,4 +320,238 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_pre_permute("mscclpp", "triton")
+def pre_permute_mscclpp_to_triton(
+    dispatch_output: MSCCLPPDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """Bridge an MSCCL++ EP dispatch output into the Triton fused-MoE runner.
+
+    The MSCCL++ EP *normal* dispatch leaves each rank with ``recv_x`` (the
+    tokens routed to its local experts) and ``recv_topk_idx`` in *local* expert
+    space (``-1`` for top-k slots whose expert lives on another rank). That is
+    exactly the token-major layout the Triton kernel already consumes, so the
+    permute is the same block-size alignment used by the standard path, just
+    driven from the dispatched tensors. ``TritonRunnerCore.run`` sets
+    ``filter_expert=True`` (global ``num_experts`` != ``num_local_experts``), so
+    the kernel skips the masked ``-1`` slots; it reduces over the top-k dim with
+    ``topk_weights`` to produce each rank's partial output. The remaining
+    cross-rank reduction is done later by the MSCCL++ combine.
+    """
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+    # Stash routing tensors so post_permute can build the MSCCL++ combine input.
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    return TritonRunnerInput(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_post_permute("triton", "mscclpp")
+def post_permute_triton_to_mscclpp(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MSCCLPPCombineInput:
+    """Package the Triton runner output for the MSCCL++ EP combine.
+
+    The Triton runner already applied ``topk_weights`` and
+    ``routed_scaling_factor`` while reducing the within-rank top-k copies, so
+    ``runner_output.hidden_states`` is each rank's per-recv-token partial result
+    ([num_recv_tokens, hidden]). It is handed straight to the MSCCL++ combine,
+    which sums those partials back to the source tokens across ranks; because the
+    weights are already baked in, that cross-rank combine must be an *unweighted*
+    sum. ``topk_ids`` / ``topk_weights`` are forwarded for the dispatcher's
+    bookkeeping (handle-driven scatter), matching the DeepEP combine-input shape.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPCombineInput
+
+    return MSCCLPPCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+
+
+@register_pre_permute("mscclpp_ll", "triton")
+def pre_permute_mscclpp_ll_to_triton(
+    dispatch_output: MSCCLPPLLDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """Bridge an MSCCL++ EP *low-latency* dispatch output into the Triton runner.
+
+    The LL dispatch leaves a *padded expert-major* buffer ``hidden_states``
+    [num_local_experts, slots_per_expert, hidden] together with ``masked_m``
+    [num_local_experts] (the number of valid slots per local expert). The Triton
+    fused kernel is token-major, so we flatten the buffer to
+    [num_local_experts * slots_per_expert, hidden] and synthesise a ``top_k=1``
+    routing table: row ``e * slots_per_expert + j`` maps to *local* expert ``e``
+    for the first ``masked_m[e]`` slots and to ``-1`` (padding) otherwise.
+    ``TritonRunnerCore.run`` sets ``filter_expert=True`` (global ``num_experts``
+    != ``num_local_experts``), so the kernel skips the ``-1`` padding slots and
+    processes every valid slot exactly once.
+
+    Weighting is the mirror image of the HT path: the MSCCL++ LL *combine*
+    applies the routing weights, so the GEMM here runs with **unit** weights. The
+    kernel still applies ``routed_scaling_factor`` (per-slot, top_k=1), and the
+    combine applies ``topk_weights``, so each is applied exactly once.
+    """
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
+
+    if hidden_states_scale is not None:
+        raise NotImplementedError(
+            "MSCCL++ LL fp8 dispatch (pre-quantized activations) is not yet "
+            "supported by the Triton runner; use BF16 LL dispatch."
+        )
+
+    num_local_experts, slots_per_expert, hidden_dim = hidden_states.shape
+    device = hidden_states.device
+
+    # Flatten the masked expert-major buffer into token-major rows.
+    hidden_flat = hidden_states.reshape(num_local_experts * slots_per_expert, hidden_dim)
+
+    # Synthetic top_k=1 routing in *local* expert space: expert ``e`` owns slots
+    # ``[0, masked_m[e])``; the remaining padding slots are tagged ``-1`` so the
+    # kernel's ``filter_expert`` path skips them. Use ``int32`` to match the
+    # standard SGLang topk output dtype (``moe_align_block_size`` and the
+    # activation kernel both require ``int32`` expert ids).
+    slot_arange = torch.arange(slots_per_expert, device=device).unsqueeze(0)
+    valid = slot_arange < masked_m.to(torch.long).unsqueeze(1)
+    expert_col = torch.arange(
+        num_local_experts, device=device, dtype=torch.int32
+    ).unsqueeze(1)
+    # ``torch.tensor(-1, device=...)`` builds the sentinel from a host scalar,
+    # which triggers an illegal CPU->CUDA copy during CUDA graph capture. Create
+    # the ``-1`` padding value on-device so ``torch.where`` stays capture-safe.
+    pad_id = expert_col.new_full((), -1)
+    triton_topk_ids = torch.where(valid, expert_col, pad_id).reshape(-1, 1)
+    # Unit weights: the LL combine re-applies the real routing weights.
+    triton_topk_weights = torch.ones(
+        (num_local_experts * slots_per_expert, 1),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_flat,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        triton_topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+    # Original routing tensors + masked layout shape, so post_permute can rebuild
+    # the expert-major buffer the MSCCL++ LL combine expects.
+    running_state["topk_ids"] = dispatch_output.topk_ids
+    running_state["topk_weights"] = dispatch_output.topk_weights
+    running_state["mscclpp_ll_shape"] = (
+        num_local_experts,
+        slots_per_expert,
+        hidden_dim,
+    )
+
+    return TritonRunnerInput(
+        hidden_states=hidden_flat,
+        topk_weights=triton_topk_weights,
+        topk_ids=triton_topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_post_permute("triton", "mscclpp_ll")
+def post_permute_triton_to_mscclpp_ll(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MSCCLPPLLCombineInput:
+    """Package the Triton runner output for the MSCCL++ EP low-latency combine.
+
+    The kernel produced a flat [num_local_experts * slots_per_expert, hidden]
+    output (one row per slot, ``routed_scaling_factor`` already applied, unit
+    routing weight). We reshape it back to the masked expert-major buffer
+    [num_local_experts, slots_per_expert, hidden] that ``low_latency_combine``
+    consumes. Padding-slot rows are ignored by the combine (it gathers only the
+    valid slots recorded in the dispatch handle), so their contents do not
+    matter. The combine applies ``topk_weights`` itself, so no weighting is done
+    here.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPLLCombineInput
+
+    num_local_experts, slots_per_expert, hidden_dim = running_state["mscclpp_ll_shape"]
+    masked_output = runner_output.hidden_states.reshape(
+        num_local_experts, slots_per_expert, hidden_dim
+    )
+
+    return MSCCLPPLLCombineInput(
+        hidden_states=masked_output,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
     )

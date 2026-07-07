@@ -37,6 +37,14 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+    MSCCLPPCombineInput,
+    MSCCLPPDispatcher,
+    MSCCLPPDispatchOutput,
+    MSCCLPPLLCombineInput,
+    MSCCLPPLLDispatcher,
+    MSCCLPPLLDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPCombineInput,
     NixlEPDispatcher,
@@ -67,6 +75,12 @@ __all__ = [
     "MoriEPLLDispatchOutput",
     "MoriEPLLCombineInput",
     "MoriEPDispatcher",
+    "MSCCLPPDispatchOutput",
+    "MSCCLPPCombineInput",
+    "MSCCLPPDispatcher",
+    "MSCCLPPLLDispatchOutput",
+    "MSCCLPPLLCombineInput",
+    "MSCCLPPLLDispatcher",
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",
