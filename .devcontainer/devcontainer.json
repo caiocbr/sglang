@@ -16,7 +16,6 @@
             ]
         }
     },
-    "privileged": true,
     "forwardPorts": [],
     "runArgs": [
         "--cap-add=SYS_PTRACE",
