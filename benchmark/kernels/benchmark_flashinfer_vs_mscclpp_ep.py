@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Benchmark MoE EP dispatch/combine with a shared FlashInfer CUTLASS runner.
 
 The two measured paths are:
@@ -75,6 +77,10 @@ class ExpertWeights:
 class CapturedPipeline:
     graph: torch.cuda.CUDAGraph
     output: torch.Tensor
+    start: torch.cuda.Event
+    dispatch_end: torch.cuda.Event
+    moe_end: torch.cuda.Event
+    end: torch.cuda.Event
 
 
 def parse_args() -> argparse.Namespace:
@@ -752,12 +758,29 @@ def capture_pipeline(pipeline: Any, inputs: Inputs) -> CapturedPipeline:
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    dispatch_end = torch.cuda.Event(enable_timing=True, external=True)
+    moe_end = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
     with torch.cuda.graph(graph):
-        output = run_once(pipeline, inputs)
+        start.record()
+        state = pipeline.dispatch(inputs)
+        dispatch_end.record()
+        expert_output = pipeline.run_moe(state)
+        moe_end.record()
+        output = pipeline.combine(state, expert_output)
+        end.record()
 
     torch.cuda.synchronize()
     dist.barrier()
-    return CapturedPipeline(graph=graph, output=output)
+    return CapturedPipeline(
+        graph=graph,
+        output=output,
+        start=start,
+        dispatch_end=dispatch_end,
+        moe_end=moe_end,
+        end=end,
+    )
 
 
 def replay_and_clone(captured: CapturedPipeline) -> torch.Tensor:
@@ -812,13 +835,16 @@ def benchmark_cuda_graph(
     warmup: int,
     iters: int,
     device: torch.device,
-) -> float:
+) -> Timing:
     for _ in range(warmup):
         captured.graph.replay()
         torch.cuda.synchronize()
         dist.barrier()
 
-    latencies_ms: list[float] = []
+    dispatch_ms: list[float] = []
+    moe_ms: list[float] = []
+    combine_ms: list[float] = []
+    e2e_ms: list[float] = []
     for _ in range(iters):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -826,14 +852,27 @@ def benchmark_cuda_graph(
         captured.graph.replay()
         end.record()
         end.synchronize()
-        latencies_ms.append(start.elapsed_time(end))
+        dispatch_ms.append(captured.start.elapsed_time(captured.dispatch_end))
+        moe_ms.append(captured.dispatch_end.elapsed_time(captured.moe_end))
+        combine_ms.append(captured.moe_end.elapsed_time(captured.end))
+        e2e_ms.append(start.elapsed_time(end))
         dist.barrier()
 
-    (e2e_us,) = reduce_max(
-        [statistics.mean(latencies_ms) * 1000],
+    dispatch_us, moe_us, combine_us, e2e_us = reduce_max(
+        [
+            statistics.mean(dispatch_ms) * 1000,
+            statistics.mean(moe_ms) * 1000,
+            statistics.mean(combine_ms) * 1000,
+            statistics.mean(e2e_ms) * 1000,
+        ],
         device,
     )
-    return e2e_us
+    return Timing(
+        dispatch_us=dispatch_us,
+        moe_us=moe_us,
+        combine_us=combine_us,
+        e2e_us=e2e_us,
+    )
 
 
 def format_markdown_table(rows: list[list[str]]) -> str:
@@ -861,6 +900,7 @@ def main() -> None:
 
     try:
         import flashinfer
+
         import mscclpp
 
         mscclpp_comm_group = mscclpp.CommGroup(
@@ -891,6 +931,12 @@ def main() -> None:
             )
             print(f"Rank-local expert weights: {weight_gib:.2f} GiB")
             print("Latency is the maximum per-rank mean GPU time.\n")
+            if args.cuda_graph:
+                print(
+                    "CUDA graph stages use embedded events and E2E uses outer "
+                    "events. Each value is independently max-reduced across "
+                    "ranks, so stage sums need not equal E2E.\n"
+                )
 
         table = [
             [
@@ -959,8 +1005,8 @@ def main() -> None:
             flashinfer_graph = None
             mscclpp_graph = None
             graph_max_abs = None
-            flashinfer_graph_us = None
-            mscclpp_graph_us = None
+            flashinfer_graph_timing = None
+            mscclpp_graph_timing = None
             if args.cuda_graph:
                 flashinfer_graph = capture_pipeline(flashinfer_pipeline, inputs)
                 mscclpp_graph = capture_pipeline(mscclpp_pipeline, inputs)
@@ -973,13 +1019,13 @@ def main() -> None:
                     atol=args.atol,
                     device=device,
                 )
-                flashinfer_graph_us = benchmark_cuda_graph(
+                flashinfer_graph_timing = benchmark_cuda_graph(
                     captured=flashinfer_graph,
                     warmup=args.warmup,
                     iters=args.iters,
                     device=device,
                 )
-                mscclpp_graph_us = benchmark_cuda_graph(
+                mscclpp_graph_timing = benchmark_cuda_graph(
                     captured=mscclpp_graph,
                     warmup=args.warmup,
                     iters=args.iters,
@@ -1024,17 +1070,19 @@ def main() -> None:
                     ]
                 )
                 if (
-                    flashinfer_graph_us is not None
-                    and mscclpp_graph_us is not None
+                    flashinfer_graph_timing is not None
+                    and mscclpp_graph_timing is not None
                     and graph_max_abs is not None
                 ):
                     flashinfer_graph_throughput = (
-                        global_tokens * 1_000_000 / flashinfer_graph_us
+                        global_tokens * 1_000_000 / flashinfer_graph_timing.e2e_us
                     )
                     mscclpp_graph_throughput = (
-                        global_tokens * 1_000_000 / mscclpp_graph_us
+                        global_tokens * 1_000_000 / mscclpp_graph_timing.e2e_us
                     )
-                    graph_speedup = flashinfer_graph_us / mscclpp_graph_us
+                    graph_speedup = (
+                        flashinfer_graph_timing.e2e_us / mscclpp_graph_timing.e2e_us
+                    )
                     table.extend(
                         [
                             [
@@ -1042,10 +1090,10 @@ def main() -> None:
                                 str(global_tokens),
                                 flashinfer_pipeline.name,
                                 "cuda_graph",
-                                "-",
-                                "-",
-                                "-",
-                                f"{flashinfer_graph_us:.1f}",
+                                f"{flashinfer_graph_timing.dispatch_us:.1f}",
+                                f"{flashinfer_graph_timing.moe_us:.1f}",
+                                f"{flashinfer_graph_timing.combine_us:.1f}",
+                                f"{flashinfer_graph_timing.e2e_us:.1f}",
                                 f"{flashinfer_graph_throughput:,.0f}",
                                 "1.000x",
                                 f"{graph_max_abs:.3g}",
@@ -1055,10 +1103,10 @@ def main() -> None:
                                 str(global_tokens),
                                 mscclpp_pipeline.name,
                                 "cuda_graph",
-                                "-",
-                                "-",
-                                "-",
-                                f"{mscclpp_graph_us:.1f}",
+                                f"{mscclpp_graph_timing.dispatch_us:.1f}",
+                                f"{mscclpp_graph_timing.moe_us:.1f}",
+                                f"{mscclpp_graph_timing.combine_us:.1f}",
+                                f"{mscclpp_graph_timing.e2e_us:.1f}",
                                 f"{mscclpp_graph_throughput:,.0f}",
                                 f"{graph_speedup:.3f}x",
                                 f"{graph_max_abs:.3g}",
