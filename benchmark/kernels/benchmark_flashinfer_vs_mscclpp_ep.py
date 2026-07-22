@@ -1,17 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Benchmark MoE EP dispatch/combine with a shared FlashInfer CUTLASS runner.
+"""Benchmark one MoE EP backend with a shared FlashInfer CUTLASS runner.
 
-The two measured paths are:
+Run the script once per backend so only one MNNVL fabric workspace is resident:
 
-1. FlashInfer ``MoeAlltoAll`` dispatch/combine + FlashInfer CUTLASS MoE.
-2. MSCCL++ EP low-latency dispatch/combine + FlashInfer CUTLASS MoE.
+1. ``--backend flashinfer``: FlashInfer ``MoeAlltoAll`` dispatch/combine.
+2. ``--backend mscclpp``: MSCCL++ EP low-latency dispatch/combine.
 
 Both paths use BF16 communication and BF16 expert compute with the same input,
-routing decisions, routing weights, and rank-local expert weights. Both
-dispatchers produce a fixed rank-major token buffer consumed by the same
-FlashInfer CUTLASS MoE call; only dispatch/combine communication differs.
+routing decisions, routing weights, and rank-local expert weights for a fixed
+seed. Both dispatchers produce a fixed rank-major token buffer consumed by the
+same FlashInfer CUTLASS MoE call; only dispatch/combine communication differs.
 
 Pass ``--cuda-graph`` to additionally capture each complete
 ``dispatch -> MoE -> combine`` path in one CUDA graph and benchmark replay
@@ -21,12 +21,16 @@ Example (DeepSeek-like shape on one 8-GPU node with MNNVL):
 
     torchrun --standalone --nproc-per-node=8 \
       benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
-      --mnnvl --cuda-graph
+      --backend flashinfer --mnnvl --cuda-graph
+    torchrun --standalone --nproc-per-node=8 \
+      benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
+      --backend mscclpp --mnnvl --cuda-graph
 
 Small smoke run:
 
     torchrun --standalone --nproc-per-node=2 \
       benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
+      --backend mscclpp \
       --tokens-per-rank 8 --hidden-size 4096 --intermediate-size 512 \
       --num-experts 8 --top-k 2 --warmup 2 --iters 5
 
@@ -39,6 +43,7 @@ participating GPUs must belong to the same NVIDIA Fabric cluster.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import statistics
 from dataclasses import dataclass
@@ -85,6 +90,12 @@ class CapturedPipeline:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--backend",
+        choices=("flashinfer", "mscclpp"),
+        required=True,
+        help="Benchmark exactly one backend so MNNVL fabric workspaces do not interfere.",
+    )
     parser.add_argument(
         "--tokens-per-rank",
         type=str,
@@ -185,7 +196,7 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         )
     if not 0 < args.top_k <= min(9, args.num_experts):
         raise ValueError("--top-k must be in [1, min(9, num_experts)]")
-    if args.hidden_size not in MSCCLPP_LL_HIDDEN_SIZES:
+    if args.backend == "mscclpp" and args.hidden_size not in MSCCLPP_LL_HIDDEN_SIZES:
         raise ValueError(
             f"--hidden-size must be one of {MSCCLPP_LL_HIDDEN_SIZES} "
             "for MSCCL++ EP low-latency"
@@ -194,12 +205,13 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--intermediate-size must be positive")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be non-negative and --iters must be positive")
-    min_blocks = world_size + 2
-    if not min_blocks <= args.low_latency_num_blocks <= 130:
-        raise ValueError(
-            "--low-latency-num-blocks must be between "
-            f"{min_blocks} and 130 for world_size={world_size}"
-        )
+    if args.backend == "mscclpp":
+        min_blocks = world_size + 2
+        if not min_blocks <= args.low_latency_num_blocks <= 130:
+            raise ValueError(
+                "--low-latency-num-blocks must be between "
+                f"{min_blocks} and 130 for world_size={world_size}"
+            )
 
 
 def make_local_weights(
@@ -557,8 +569,8 @@ class MscclppPipeline:
         self.hidden_size = args.hidden_size
         self.num_experts = args.num_experts
         self.num_tokens = num_tokens
+        self.name = "mscclpp_ep_ll_rank_major"
         num_local_experts = args.num_experts // world_size
-
         self.communicator = MoECommunicator(
             MoECommunicatorConfig(
                 comm=comm_group,
@@ -570,8 +582,7 @@ class MscclppPipeline:
                 topk=args.top_k,
                 max_tokens_per_rank=num_tokens,
                 mode=MoEMode.LOW_LATENCY,
-                output_layout=DispatchLayout.TOKEN_MAJOR,
-                token_major_init_padding=True,
+                output_layout=DispatchLayout.RANK_MAJOR,
                 invalid_token_expert_id=args.num_experts,
                 low_latency_num_blocks=args.low_latency_num_blocks,
                 low_latency_combine_mode=CombineMode.RANK_LOCAL_REDUCE,
@@ -581,10 +592,8 @@ class MscclppPipeline:
             raise RuntimeError("MSCCL++ EP low-latency runtime is unavailable")
 
         capacity = world_size * num_tokens
-        self.dispatch_output = torch.empty(
-            (capacity, args.hidden_size), dtype=DTYPE, device=device
-        )
-        self.expert_output = torch.empty_like(self.dispatch_output)
+        self.dispatch_output = None
+        self.expert_output = self.communicator.get_expert_output_buffer()
         self.combine_output = torch.empty(
             (num_tokens, args.hidden_size), dtype=DTYPE, device=device
         )
@@ -593,7 +602,7 @@ class MscclppPipeline:
             rank=rank,
             world_size=world_size,
             max_dispatched_tokens=capacity,
-            enable_alltoall=False,
+            enable_alltoall=True,
         )
 
     def dispatch(self, inputs: Inputs) -> tuple[Any, Any]:
@@ -607,7 +616,7 @@ class MscclppPipeline:
     def run_moe(self, state: tuple[Any, Any]) -> torch.Tensor:
         dispatch_output, _ = state
         if dispatch_output.topk_ids is None or dispatch_output.weights is None:
-            raise RuntimeError("MSCCL++ TOKEN_MAJOR dispatch metadata is missing")
+            raise RuntimeError("MSCCL++ RANK_MAJOR dispatch metadata is missing")
         return self.moe(
             hidden_states=dispatch_output.tokens,
             topk_ids=dispatch_output.topk_ids,
@@ -901,13 +910,17 @@ def main() -> None:
     try:
         import flashinfer
 
-        import mscclpp
+        mscclpp = None
+        mscclpp_comm_group = None
+        if args.backend == "mscclpp":
+            import mscclpp as imported_mscclpp
 
-        mscclpp_comm_group = mscclpp.CommGroup(
-            torch_group=cpu_group,
-            rank=rank,
-            size=world_size,
-        )
+            mscclpp = imported_mscclpp
+            mscclpp_comm_group = mscclpp.CommGroup(
+                torch_group=cpu_group,
+                rank=rank,
+                size=world_size,
+            )
         weights = make_local_weights(args, rank, world_size, device)
         torch.cuda.synchronize()
         dist.barrier()
@@ -919,16 +932,16 @@ def main() -> None:
             print(
                 "Configuration: "
                 f"world_size={world_size}, nodes={num_nodes}, "
-                f"mnnvl={args.mnnvl}, dtype=bf16, "
+                f"backend={args.backend}, mnnvl={args.mnnvl}, dtype=bf16, "
                 f"hidden={args.hidden_size}, intermediate={args.intermediate_size}, "
                 f"experts={args.num_experts}, top_k={args.top_k}, "
                 f"tokens_per_rank={token_counts}, warmup={args.warmup}, "
                 f"iters={args.iters}, cuda_graph={args.cuda_graph}"
             )
-            print(
-                f"Versions: flashinfer={flashinfer.__version__}, "
-                f"mscclpp={mscclpp.__version__}"
-            )
+            versions = f"flashinfer={flashinfer.__version__}"
+            if mscclpp is not None:
+                versions += f", mscclpp={mscclpp.__version__}"
+            print(f"Versions: {versions}")
             print(f"Rank-local expert weights: {weight_gib:.2f} GiB")
             print("Latency is the maximum per-rank mean GPU time.\n")
             if args.cuda_graph:
@@ -949,84 +962,74 @@ def main() -> None:
                 "combine (us)",
                 "E2E (us)",
                 "global tok/s",
-                "E2E speedup",
-                "max abs diff",
+                "graph/eager max abs",
             ]
         ]
 
         for num_tokens in token_counts:
             inputs = make_inputs(args, rank, num_tokens, device)
-            flashinfer_pipeline = FlashInferPipeline(
-                args=args,
-                rank=rank,
-                world_size=world_size,
-                num_tokens=num_tokens,
-                weights=weights,
-                group=dist.group.WORLD,
-            )
-            mscclpp_pipeline = MscclppPipeline(
-                args=args,
-                rank=rank,
-                world_size=world_size,
-                num_tokens=num_tokens,
-                weights=weights,
-                comm_group=mscclpp_comm_group,
-                device=device,
-            )
+            if args.backend == "flashinfer":
+                pipeline = FlashInferPipeline(
+                    args=args,
+                    rank=rank,
+                    world_size=world_size,
+                    num_tokens=num_tokens,
+                    weights=weights,
+                    group=dist.group.WORLD,
+                )
+            else:
+                assert mscclpp_comm_group is not None
+                pipeline = MscclppPipeline(
+                    args=args,
+                    rank=rank,
+                    world_size=world_size,
+                    num_tokens=num_tokens,
+                    weights=weights,
+                    comm_group=mscclpp_comm_group,
+                    device=device,
+                )
 
-            (
-                max_abs,
-                _,
-                flashinfer_eager_output,
-                mscclpp_eager_output,
-            ) = check_correctness(
-                flashinfer_pipeline=flashinfer_pipeline,
-                mscclpp_pipeline=mscclpp_pipeline,
-                inputs=inputs,
-                rtol=args.rtol,
-                atol=args.atol,
+            torch.cuda.synchronize()
+            dist.barrier()
+            eager_output = run_once(pipeline, inputs).clone()
+            torch.cuda.synchronize()
+            dist.barrier()
+            finite = torch.tensor(
+                int(torch.isfinite(eager_output).all()),
+                dtype=torch.int32,
                 device=device,
             )
-            flashinfer_timing = benchmark_pipeline(
-                pipeline=flashinfer_pipeline,
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not bool(finite.item()):
+                raise AssertionError(
+                    f"{pipeline.name} eager output contains NaN or Inf"
+                )
+
+            eager_timing = benchmark_pipeline(
+                pipeline=pipeline,
                 inputs=inputs,
                 warmup=args.warmup,
                 iters=args.iters,
                 device=device,
             )
-            mscclpp_timing = benchmark_pipeline(
-                pipeline=mscclpp_pipeline,
-                inputs=inputs,
-                warmup=args.warmup,
-                iters=args.iters,
-                device=device,
-            )
 
-            flashinfer_graph = None
-            mscclpp_graph = None
+            graph = None
+            graph_output = None
             graph_max_abs = None
-            flashinfer_graph_timing = None
-            mscclpp_graph_timing = None
+            graph_timing = None
             if args.cuda_graph:
-                flashinfer_graph = capture_pipeline(flashinfer_pipeline, inputs)
-                mscclpp_graph = capture_pipeline(mscclpp_pipeline, inputs)
-                graph_max_abs, _ = check_cuda_graph_correctness(
-                    flashinfer_graph=flashinfer_graph,
-                    mscclpp_graph=mscclpp_graph,
-                    flashinfer_eager_output=flashinfer_eager_output,
-                    mscclpp_eager_output=mscclpp_eager_output,
+                graph = capture_pipeline(pipeline, inputs)
+                graph_output = replay_and_clone(graph)
+                graph_max_abs, _ = assert_outputs_close(
+                    reference=eager_output,
+                    candidate=graph_output,
                     rtol=args.rtol,
                     atol=args.atol,
                     device=device,
+                    label=f"{pipeline.name} eager and CUDA graph",
                 )
-                flashinfer_graph_timing = benchmark_cuda_graph(
-                    captured=flashinfer_graph,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    device=device,
-                )
-                mscclpp_graph_timing = benchmark_cuda_graph(
-                    captured=mscclpp_graph,
+                graph_timing = benchmark_cuda_graph(
+                    captured=graph,
                     warmup=args.warmup,
                     iters=args.iters,
                     device=device,
@@ -1034,105 +1037,56 @@ def main() -> None:
 
             if rank == 0:
                 global_tokens = num_tokens * world_size
-                flashinfer_throughput = (
-                    global_tokens * 1_000_000 / flashinfer_timing.e2e_us
-                )
-                mscclpp_throughput = global_tokens * 1_000_000 / mscclpp_timing.e2e_us
-                speedup = flashinfer_timing.e2e_us / mscclpp_timing.e2e_us
-                table.extend(
+                eager_throughput = global_tokens * 1_000_000 / eager_timing.e2e_us
+                table.append(
                     [
-                        [
-                            str(num_tokens),
-                            str(global_tokens),
-                            flashinfer_pipeline.name,
-                            "eager",
-                            f"{flashinfer_timing.dispatch_us:.1f}",
-                            f"{flashinfer_timing.moe_us:.1f}",
-                            f"{flashinfer_timing.combine_us:.1f}",
-                            f"{flashinfer_timing.e2e_us:.1f}",
-                            f"{flashinfer_throughput:,.0f}",
-                            "1.000x",
-                            f"{max_abs:.3g}",
-                        ],
-                        [
-                            str(num_tokens),
-                            str(global_tokens),
-                            mscclpp_pipeline.name,
-                            "eager",
-                            f"{mscclpp_timing.dispatch_us:.1f}",
-                            f"{mscclpp_timing.moe_us:.1f}",
-                            f"{mscclpp_timing.combine_us:.1f}",
-                            f"{mscclpp_timing.e2e_us:.1f}",
-                            f"{mscclpp_throughput:,.0f}",
-                            f"{speedup:.3f}x",
-                            f"{max_abs:.3g}",
-                        ],
+                        str(num_tokens),
+                        str(global_tokens),
+                        pipeline.name,
+                        "eager",
+                        f"{eager_timing.dispatch_us:.1f}",
+                        f"{eager_timing.moe_us:.1f}",
+                        f"{eager_timing.combine_us:.1f}",
+                        f"{eager_timing.e2e_us:.1f}",
+                        f"{eager_throughput:,.0f}",
+                        "-",
                     ]
                 )
-                if (
-                    flashinfer_graph_timing is not None
-                    and mscclpp_graph_timing is not None
-                    and graph_max_abs is not None
-                ):
-                    flashinfer_graph_throughput = (
-                        global_tokens * 1_000_000 / flashinfer_graph_timing.e2e_us
-                    )
-                    mscclpp_graph_throughput = (
-                        global_tokens * 1_000_000 / mscclpp_graph_timing.e2e_us
-                    )
-                    graph_speedup = (
-                        flashinfer_graph_timing.e2e_us / mscclpp_graph_timing.e2e_us
-                    )
-                    table.extend(
+                if graph_timing is not None and graph_max_abs is not None:
+                    graph_throughput = global_tokens * 1_000_000 / graph_timing.e2e_us
+                    table.append(
                         [
-                            [
-                                str(num_tokens),
-                                str(global_tokens),
-                                flashinfer_pipeline.name,
-                                "cuda_graph",
-                                f"{flashinfer_graph_timing.dispatch_us:.1f}",
-                                f"{flashinfer_graph_timing.moe_us:.1f}",
-                                f"{flashinfer_graph_timing.combine_us:.1f}",
-                                f"{flashinfer_graph_timing.e2e_us:.1f}",
-                                f"{flashinfer_graph_throughput:,.0f}",
-                                "1.000x",
-                                f"{graph_max_abs:.3g}",
-                            ],
-                            [
-                                str(num_tokens),
-                                str(global_tokens),
-                                mscclpp_pipeline.name,
-                                "cuda_graph",
-                                f"{mscclpp_graph_timing.dispatch_us:.1f}",
-                                f"{mscclpp_graph_timing.moe_us:.1f}",
-                                f"{mscclpp_graph_timing.combine_us:.1f}",
-                                f"{mscclpp_graph_timing.e2e_us:.1f}",
-                                f"{mscclpp_graph_throughput:,.0f}",
-                                f"{graph_speedup:.3f}x",
-                                f"{graph_max_abs:.3g}",
-                            ],
+                            str(num_tokens),
+                            str(global_tokens),
+                            pipeline.name,
+                            "cuda_graph",
+                            f"{graph_timing.dispatch_us:.1f}",
+                            f"{graph_timing.moe_us:.1f}",
+                            f"{graph_timing.combine_us:.1f}",
+                            f"{graph_timing.e2e_us:.1f}",
+                            f"{graph_throughput:,.0f}",
+                            f"{graph_max_abs:.3g}",
                         ]
                     )
                 print(
-                    f"Finished tokens_per_rank={num_tokens}: "
-                    f"MSCCL++ E2E speedup={speedup:.3f}x"
+                    f"Finished backend={args.backend} tokens_per_rank={num_tokens}: "
+                    f"E2E={eager_timing.e2e_us:.1f}us"
                 )
 
             torch.cuda.synchronize()
-            if flashinfer_graph is not None:
-                flashinfer_graph.graph.reset()
-            if mscclpp_graph is not None:
-                mscclpp_graph.graph.reset()
-            flashinfer_pipeline.close()
+            if graph is not None:
+                graph.graph.reset()
+            if args.backend == "flashinfer":
+                pipeline.close()
             del (
-                flashinfer_pipeline,
-                mscclpp_pipeline,
-                flashinfer_eager_output,
-                mscclpp_eager_output,
-                flashinfer_graph,
-                mscclpp_graph,
+                pipeline,
+                eager_output,
+                graph_output,
+                graph,
                 inputs,
             )
+            gc.collect()
+            torch.cuda.empty_cache()
             dist.barrier()
 
         if rank == 0:
