@@ -1,6 +1,6 @@
 ---
 name: nvme-raid-docker-migration
-description: Set up blank local NVMe disks as RAID0 scratch storage and migrate Docker and containerd containers, images, volumes, and build cache to it. Use for MNNVL or HPC nodes with small OS disks and multiple empty local NVMe disks.
+description: Set up blank local NVMe disks as RAID0 scratch storage, migrate Docker and containerd data, and fix numeric UID permissions for bind-mounted Dev Container workspaces. Use for MNNVL or HPC nodes with small OS disks and local NVMe disks.
 ---
 
 # NVMe RAID0 Docker migration
@@ -25,6 +25,9 @@ commands when the target layout matches this workflow.
    VS Code/SSH processes do not gain new supplementary groups, grant that user
    a socket ACL for the current session when `setfacl` is available; a fresh
    login or VS Code reconnect is still the persistent activation step.
+8. Grant Dev Container ACLs at the complete bind-mounted workspace root, not
+   only at a package subdirectory. Editors, Git, builds, and generated files may
+   need write access anywhere in the repository, including `.git`.
 
 ## Run the bundled script
 
@@ -78,6 +81,37 @@ The script:
 9. Preserves non-root Docker access after service restarts by ensuring `docker`
    group membership and, when needed, applying a user ACL to the current socket.
 
+## Grant a Dev Container access to a bind-mounted workspace
+
+Bind mounts preserve numeric ownership. If the host workspace belongs to UID
+1000 while the container user is UID 1003, mode `775` does not make the
+workspace writable because UID 1003 is neither its owner nor a member of the
+host file's group.
+
+Do not use `chmod -R 777` or change the source tree's owner. Grant the container
+UID a named POSIX ACL to the entire repository. If its matching Dev Container
+is running, the helper discovers the UID automatically:
+
+```bash
+bash .claude/skills/nvme-raid-docker-migration/scripts/grant-devcontainer-workspace-access.sh \
+  /home/azhpcuser/sglang
+```
+
+If the container is not running, pass its numeric UID explicitly while still
+targeting the complete workspace:
+
+```bash
+bash .claude/skills/nvme-raid-docker-migration/scripts/grant-devcontainer-workspace-access.sh \
+  /home/azhpcuser/sglang \
+  1003
+```
+
+The helper preserves host ownership, grants the named UID read/write access,
+preserves execution only on files already marked executable, and installs
+default directory ACLs so newly created files and directories inherit access.
+Apply it to the path used by the `devcontainer.local_folder` label, including
+the repository's `.git` directory.
+
 ## Verify completion
 
 ```bash
@@ -90,6 +124,7 @@ findmnt /mnt/scratch
 sudo mdadm --detail /dev/md0
 grep /mnt/scratch /etc/fstab
 grep 'ARRAY /dev/md0' /etc/mdadm/mdadm.conf
+getfacl -p /path/to/workspace
 ```
 
 Expected results are active Docker and containerd services, both persistent
