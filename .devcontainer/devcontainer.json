@@ -19,8 +19,15 @@
     "forwardPorts": [],
     "runArgs": [
         "--cap-add=SYS_PTRACE",
+        "--device=/dev/nvidia-caps-imex-channels/channel0:/dev/nvidia-caps-imex-channels/channel0",
         "--gpus",
-        "all"
+        "all",
+        "--network=host",
+        "--shm-size=512g",
+        "--ulimit",
+        "memlock=-1:-1",
+        "--ulimit",
+        "stack=8388608:8388608"
     ],
     // The two lines below ensures that your local changes in the sglang
     // repo is automatically synced to the sglang pip package installed

@@ -15,11 +15,11 @@ Pass ``--cuda-graph`` to additionally capture each complete
 ``dispatch -> MoE -> combine`` path in one CUDA graph and benchmark replay
 latency.
 
-Example (DeepSeek-like shape on one 8-GPU node):
+Example (DeepSeek-like shape on one 8-GPU node with MNNVL):
 
     torchrun --standalone --nproc-per-node=8 \
       benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
-      --cuda-graph
+      --mnnvl --cuda-graph
 
 Small smoke run:
 
@@ -28,9 +28,10 @@ Small smoke run:
       --tokens-per-rank 8 --hidden-size 4096 --intermediate-size 512 \
       --num-experts 8 --top-k 2 --warmup 2 --iters 5
 
-This benchmark is intentionally single-node. Its FlashInfer workspace uses
-single-node CUDA virtual memory and POSIX FD exchange over Unix sockets, so it
-does not require MNNVL fabric or ``SYS_PTRACE``.
+By default, the FlashInfer workspace uses single-node CUDA virtual memory and
+POSIX FD exchange over Unix sockets. Pass ``--mnnvl`` to use FlashInfer's
+standard MNNVL fabric workspace. Multi-node runs require ``--mnnvl`` and all
+participating GPUs must belong to the same NVIDIA Fabric cluster.
 """
 
 from __future__ import annotations
@@ -95,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also benchmark one full dispatch + MoE + combine CUDA graph replay.",
     )
+    parser.add_argument(
+        "--mnnvl",
+        action="store_true",
+        help="Use FlashInfer's MNNVL fabric workspace; required for multi-node.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--weight-std",
@@ -150,11 +156,23 @@ def initialize_distributed() -> tuple[int, int, int, dist.ProcessGroup]:
 
 def validate_args(args: argparse.Namespace, world_size: int) -> None:
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
-    if world_size != local_world_size:
+    if world_size % local_world_size != 0:
         raise ValueError(
-            "This benchmark only supports a single node: "
+            f"world_size={world_size} must be divisible by "
+            f"local_world_size={local_world_size}"
+        )
+    if world_size != local_world_size and not args.mnnvl:
+        raise ValueError(
+            "Multi-node runs require --mnnvl: "
             f"world_size={world_size}, local_world_size={local_world_size}"
         )
+    if args.mnnvl:
+        from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+        if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
+            raise RuntimeError(
+                "--mnnvl requires NVIDIA Fabric support on every participating GPU"
+            )
     if args.num_experts % world_size != 0:
         raise ValueError(
             f"num_experts={args.num_experts} must be divisible by world_size={world_size}"
@@ -368,6 +386,36 @@ def make_single_node_moe_alltoall(
     )
 
 
+def make_torch_distributed_comm_backend(group: dist.ProcessGroup) -> Any:
+    from flashinfer.comm.mnnvl import CommBackend
+
+    class TorchDistributedCommBackend(CommBackend):
+        def Get_rank(self) -> int:
+            return group.rank()
+
+        def Get_size(self) -> int:
+            return group.size()
+
+        def allgather(self, data: int) -> list[Any]:
+            gathered = [None] * self.Get_size()
+            dist.all_gather_object(gathered, data, group=group)
+            return gathered
+
+        def bcast(self, data: Any, root: int = 0) -> Any:
+            objects = [data]
+            dist.broadcast_object_list(objects, src=root, group=group)
+            return objects[0]
+
+        def Split(self, color: int, key: int) -> TorchDistributedCommBackend:
+            del color, key
+            return self
+
+        def barrier(self) -> None:
+            dist.barrier(group=group)
+
+    return TorchDistributedCommBackend()
+
+
 class FlashInferPipeline:
     name = "flashinfer_a2a"
 
@@ -380,12 +428,9 @@ class FlashInferPipeline:
         weights: ExpertWeights,
         group: dist.ProcessGroup,
     ) -> None:
-        from flashinfer.comm import moe_a2a_get_workspace_size_per_rank
+        from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
         from flashinfer.comm.mapping import Mapping
-
-        from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
-            TorchDistributedCommBackend,
-        )
+        from flashinfer.comm.mnnvl import MnnvlConfig
 
         dispatch_bytes_per_token = (
             args.hidden_size * DTYPE.itemsize
@@ -408,14 +453,26 @@ class FlashInferPipeline:
             pp_size=1,
             cp_size=1,
         )
-        self.a2a = make_single_node_moe_alltoall(
-            mapping=mapping,
-            max_num_tokens=num_tokens,
-            top_k=args.top_k,
-            num_experts=args.num_experts,
-            workspace_size_per_rank=workspace_size,
-            comm_backend=TorchDistributedCommBackend(group),
-        )
+        comm_backend = make_torch_distributed_comm_backend(group)
+        if args.mnnvl:
+            self.name = "flashinfer_a2a_mnnvl"
+            self.a2a = MoeAlltoAll(
+                mapping=mapping,
+                max_num_tokens=num_tokens,
+                top_k=args.top_k,
+                num_experts=args.num_experts,
+                workspace_size_per_rank=workspace_size,
+                mnnvl_config=MnnvlConfig(comm_backend=comm_backend),
+            )
+        else:
+            self.a2a = make_single_node_moe_alltoall(
+                mapping=mapping,
+                max_num_tokens=num_tokens,
+                top_k=args.top_k,
+                num_experts=args.num_experts,
+                workspace_size_per_rank=workspace_size,
+                comm_backend=comm_backend,
+            )
         self.num_tokens = num_tokens
         self.hidden_size = args.hidden_size
         self.num_experts = args.num_experts
@@ -816,10 +873,13 @@ def main() -> None:
         dist.barrier()
 
         if rank == 0:
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+            num_nodes = world_size // local_world_size
             weight_gib = (weights.w13.nbytes + weights.w2.nbytes) / (1024**3)
             print(
                 "Configuration: "
-                f"world_size={world_size}, dtype=bf16, "
+                f"world_size={world_size}, nodes={num_nodes}, "
+                f"mnnvl={args.mnnvl}, dtype=bf16, "
                 f"hidden={args.hidden_size}, intermediate={args.intermediate_size}, "
                 f"experts={args.num_experts}, top_k={args.top_k}, "
                 f"tokens_per_rank={token_counts}, warmup={args.warmup}, "
