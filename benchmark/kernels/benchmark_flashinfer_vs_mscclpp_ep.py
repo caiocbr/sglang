@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Benchmark one MoE EP backend with a shared FlashInfer CUTLASS runner.
+"""Benchmark one MoE EP backend with FlashInfer CUTLASS MoE.
 
 Run the script once per backend so only one MNNVL fabric workspace is resident:
 
@@ -10,21 +10,18 @@ Run the script once per backend so only one MNNVL fabric workspace is resident:
 
 Both paths use BF16 communication and BF16 expert compute with the same input,
 routing decisions, routing weights, and rank-local expert weights for a fixed
-seed. Both dispatchers produce a fixed rank-major token buffer consumed by the
-same FlashInfer CUTLASS MoE call; only dispatch/combine communication differs.
-
-Pass ``--cuda-graph`` to additionally capture each complete
-``dispatch -> MoE -> combine`` path in one CUDA graph and benchmark replay
-latency.
+seed. Both dispatchers produce fixed-capacity token buffers consumed through
+SGLang's production FlashInfer CUTLASS fused-runner entry; only
+dispatch/combine communication differs.
 
 Example (DeepSeek-like shape on one 8-GPU node with MNNVL):
 
     torchrun --standalone --nproc-per-node=8 \
       benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
-      --backend flashinfer --mnnvl --cuda-graph
+      --backend flashinfer --mnnvl
     torchrun --standalone --nproc-per-node=8 \
       benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py \
-      --backend mscclpp --mnnvl --cuda-graph
+      --backend mscclpp --mnnvl
 
 Small smoke run:
 
@@ -45,15 +42,15 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import statistics
+import time
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
 DTYPE = torch.bfloat16
-MSCCLPP_LL_HIDDEN_SIZES = (4096, 6656, 7168, 8192, 9216)
+MSCCLPP_LL_HIDDEN_SIZES = (4096, 6656, 7168, 8192, 8704, 9216)
 
 
 @dataclass
@@ -62,6 +59,21 @@ class Inputs:
     topk_ids_i64: torch.Tensor
     topk_ids_i32: torch.Tensor
     topk_weights: torch.Tensor
+
+
+@dataclass
+class SglangTopKOutput:
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+
+
+@dataclass
+class SglangDispatchOutput:
+    hidden_states: torch.Tensor
+    hidden_states_scale: torch.Tensor | None
+    topk_output: SglangTopKOutput
+    moe_output: torch.Tensor
 
 
 @dataclass
@@ -82,10 +94,6 @@ class ExpertWeights:
 class CapturedPipeline:
     graph: torch.cuda.CUDAGraph
     output: torch.Tensor
-    start: torch.cuda.Event
-    dispatch_end: torch.cuda.Event
-    moe_end: torch.cuda.Event
-    end: torch.cuda.Event
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,11 +115,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
-        "--cuda-graph",
+        "--iters",
+        type=int,
+        default=50,
+        help="Number of production-style single-step CUDA Graph replays measured.",
+    )
+    parser.add_argument(
+        "--disable-torch-profiler",
         action="store_true",
-        help="Also benchmark one full dispatch + MoE + combine CUDA graph replay.",
+        help="Report wall-clock E2E time per graph replay instead of per-stage CUDA kernel time.",
+    )
+    parser.add_argument(
+        "--skip-moe-autotune",
+        action="store_true",
+        help="Use FlashInfer CUTLASS fallback tactics instead of exact-shape autotuning.",
     )
     parser.add_argument(
         "--mnnvl",
@@ -147,10 +165,6 @@ def parse_token_counts(value: str) -> list[int]:
     if not token_counts or any(count <= 0 for count in token_counts):
         raise ValueError("--tokens-per-rank must contain positive integers")
     return token_counts
-
-
-def next_power_of_2(value: int) -> int:
-    return 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
 def initialize_distributed() -> tuple[int, int, int, dist.ProcessGroup]:
@@ -280,28 +294,57 @@ def make_inputs(
     )
 
 
-class CutlassMoe:
+class SglangCutlassMoe:
     def __init__(
         self,
         weights: ExpertWeights,
         rank: int,
         world_size: int,
         max_dispatched_tokens: int,
+        top_k: int,
         enable_alltoall: bool,
     ) -> None:
-        from flashinfer.fused_moe import cutlass_fused_moe
-        from flashinfer.fused_moe.core import ActivationType
+        # Production model loading initializes the quantization registry before the MoE runner.
+        import sglang.srt.layers.quantization  # noqa: F401
 
-        self.cutlass_fused_moe = cutlass_fused_moe
-        self.activation_type = ActivationType.Swiglu
-        self.w13 = weights.w13
-        self.w2 = weights.w2
-        if self.w13.dtype != DTYPE or self.w2.dtype != DTYPE:
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMoeQuantInfo,
+            _run_flashinfer_cutlass,
+        )
+
+        self.run_fused_experts = _run_flashinfer_cutlass
+        if weights.w13.dtype != DTYPE or weights.w2.dtype != DTYPE:
             raise TypeError("FlashInfer CUTLASS BF16 MoE requires BF16 expert weights")
-        self.rank = rank
-        self.world_size = world_size
-        self.enable_alltoall = enable_alltoall
-        self.tune_max_num_tokens = next_power_of_2(max_dispatched_tokens)
+        if not enable_alltoall:
+            raise ValueError("SGLang FlashInfer EP workflow requires enable_alltoall")
+        self.quant_info = FlashInferCutlassMoeQuantInfo(
+            quant_type="bf16",
+            w13_weight=weights.w13,
+            w2_weight=weights.w2,
+            output_dtype=DTYPE,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            moe_ep_size=world_size,
+            moe_ep_rank=rank,
+            apply_routed_scaling_factor=True,
+        )
+        self.runner_config = MoeRunnerConfig(
+            num_experts=weights.w13.shape[0] * world_size,
+            num_local_experts=weights.w13.shape[0],
+            hidden_size=weights.w13.shape[-1],
+            intermediate_size_per_partition=weights.w2.shape[-1],
+            top_k=top_k,
+            params_dtype=DTYPE,
+            activation="silu",
+            is_gated=True,
+            apply_router_weight_on_input=False,
+            inplace=True,
+        )
+        self.max_dispatched_tokens = max_dispatched_tokens
+        self.router_logits = torch.empty(
+            0, dtype=torch.float32, device=weights.w13.device
+        )
 
     def __call__(
         self,
@@ -312,25 +355,27 @@ class CutlassMoe:
     ) -> torch.Tensor:
         if hidden_states.dtype != DTYPE or output.dtype != DTYPE:
             raise TypeError("FlashInfer CUTLASS BF16 MoE requires BF16 input/output")
-        result = self.cutlass_fused_moe(
-            input=hidden_states,
-            token_selected_experts=topk_ids.to(torch.int32),
-            token_final_scales=topk_weights,
-            fc1_expert_weights=self.w13,
-            fc2_expert_weights=self.w2,
-            output_dtype=hidden_states.dtype,
-            input_sf=None,
-            quant_scales=None,
-            ep_size=self.world_size,
-            ep_rank=self.rank,
-            tp_size=1,
-            tp_rank=0,
-            output=output,
-            enable_alltoall=self.enable_alltoall,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            activation_type=self.activation_type,
+        if hidden_states.shape[0] > self.max_dispatched_tokens:
+            raise ValueError(
+                "dispatched rows exceed the configured SGLang MoE capacity"
+            )
+        dispatch_output = SglangDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=SglangTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=self.router_logits,
+            ),
+            moe_output=output,
         )
-        return result[0]
+        return self.run_fused_experts(
+            dispatch_output=dispatch_output,
+            quant_info=self.quant_info,
+            runner_config=self.runner_config,
+            output=output,
+            enable_alltoall=True,
+        )
 
 
 def make_single_node_moe_alltoall(
@@ -495,11 +540,12 @@ class FlashInferPipeline:
         self.hidden_size = args.hidden_size
         self.num_experts = args.num_experts
         self.world_size = world_size
-        self.moe = CutlassMoe(
+        self.moe = SglangCutlassMoe(
             weights=weights,
             rank=rank,
             world_size=world_size,
             max_dispatched_tokens=world_size * num_tokens,
+            top_k=args.top_k,
             # FlashInfer's dispatcher uses the runner's fixed rank-major A2A mode.
             enable_alltoall=True,
         )
@@ -597,11 +643,12 @@ class MscclppPipeline:
         self.combine_output = torch.empty(
             (num_tokens, args.hidden_size), dtype=DTYPE, device=device
         )
-        self.moe = CutlassMoe(
+        self.moe = SglangCutlassMoe(
             weights=weights,
             rank=rank,
             world_size=world_size,
             max_dispatched_tokens=capacity,
+            top_k=args.top_k,
             enable_alltoall=True,
         )
 
@@ -641,10 +688,44 @@ def run_once(pipeline: Any, inputs: Inputs) -> torch.Tensor:
     return pipeline.combine(state, expert_output)
 
 
-def reduce_max(values: Sequence[float], device: torch.device) -> list[float]:
+def autotune_moe(
+    pipeline: Any,
+    inputs: Inputs,
+    dispatched_tokens: int,
+    sync_group: dist.ProcessGroup,
+) -> None:
+    from flashinfer.autotuner import autotune
+
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    with autotune(True, tuning_buckets=(dispatched_tokens,)):
+        run_once(pipeline, inputs)
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+
+def reduce_max(values: list[float], device: torch.device) -> list[float]:
     tensor = torch.tensor(values, dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     return tensor.cpu().tolist()
+
+
+def reduce_mean(values: list[float], device: torch.device) -> list[float]:
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+    return tensor.cpu().tolist()
+
+
+def synchronize_stream_and_ranks(
+    mscclpp_comm_group: Any | None,
+    cpu_group: dist.ProcessGroup,
+) -> None:
+    torch.cuda.current_stream().synchronize()
+    if mscclpp_comm_group is not None:
+        mscclpp_comm_group.barrier()
+    else:
+        dist.barrier(group=cpu_group)
 
 
 def assert_outputs_close(
@@ -683,205 +764,200 @@ def assert_outputs_close(
     return max_abs_value, max_rel_value
 
 
-def check_correctness(
-    flashinfer_pipeline: FlashInferPipeline,
-    mscclpp_pipeline: MscclppPipeline,
-    inputs: Inputs,
-    rtol: float,
-    atol: float,
-    device: torch.device,
-) -> tuple[float, float, torch.Tensor, torch.Tensor]:
-    flashinfer_output = run_once(flashinfer_pipeline, inputs).clone()
-    mscclpp_output = run_once(mscclpp_pipeline, inputs).clone()
-    torch.cuda.synchronize()
-
-    max_abs, max_rel = assert_outputs_close(
-        reference=flashinfer_output,
-        candidate=mscclpp_output,
-        rtol=rtol,
-        atol=atol,
-        device=device,
-        label="FlashInfer eager and MSCCL++ eager",
-    )
-    return max_abs, max_rel, flashinfer_output, mscclpp_output
-
-
-def benchmark_pipeline(
+def capture_pipeline(
     pipeline: Any,
     inputs: Inputs,
     warmup: int,
-    iters: int,
-    device: torch.device,
-) -> Timing:
+    sync_group: dist.ProcessGroup,
+) -> CapturedPipeline:
     for _ in range(warmup):
         run_once(pipeline, inputs)
-        torch.cuda.synchronize()
-        dist.barrier()
-
-    dispatch_ms: list[float] = []
-    moe_ms: list[float] = []
-    combine_ms: list[float] = []
-    e2e_ms: list[float] = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        dispatch_end = torch.cuda.Event(enable_timing=True)
-        moe_end = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-        state = pipeline.dispatch(inputs)
-        dispatch_end.record()
-        expert_output = pipeline.run_moe(state)
-        moe_end.record()
-        pipeline.combine(state, expert_output)
-        end.record()
-        end.synchronize()
-
-        dispatch_ms.append(start.elapsed_time(dispatch_end))
-        moe_ms.append(dispatch_end.elapsed_time(moe_end))
-        combine_ms.append(moe_end.elapsed_time(end))
-        e2e_ms.append(start.elapsed_time(end))
-        # Keep LL peers in lockstep without including the pacing barrier in timing.
-        dist.barrier()
-
-    dispatch_us, moe_us, combine_us, e2e_us = reduce_max(
-        [
-            statistics.mean(dispatch_ms) * 1000,
-            statistics.mean(moe_ms) * 1000,
-            statistics.mean(combine_ms) * 1000,
-            statistics.mean(e2e_ms) * 1000,
-        ],
-        device,
-    )
-    return Timing(
-        dispatch_us=dispatch_us,
-        moe_us=moe_us,
-        combine_us=combine_us,
-        e2e_us=e2e_us,
-    )
-
-
-def capture_pipeline(pipeline: Any, inputs: Inputs) -> CapturedPipeline:
-    run_once(pipeline, inputs)
     torch.cuda.synchronize()
-    dist.barrier()
+    dist.barrier(group=sync_group)
 
     graph = torch.cuda.CUDAGraph()
-    start = torch.cuda.Event(enable_timing=True, external=True)
-    dispatch_end = torch.cuda.Event(enable_timing=True, external=True)
-    moe_end = torch.cuda.Event(enable_timing=True, external=True)
-    end = torch.cuda.Event(enable_timing=True, external=True)
     with torch.cuda.graph(graph):
-        start.record()
-        state = pipeline.dispatch(inputs)
-        dispatch_end.record()
-        expert_output = pipeline.run_moe(state)
-        moe_end.record()
-        output = pipeline.combine(state, expert_output)
-        end.record()
+        output = run_once(pipeline, inputs)
 
     torch.cuda.synchronize()
-    dist.barrier()
-    return CapturedPipeline(
-        graph=graph,
-        output=output,
-        start=start,
-        dispatch_end=dispatch_end,
-        moe_end=moe_end,
-        end=end,
+    dist.barrier(group=sync_group)
+    return CapturedPipeline(graph=graph, output=output)
+
+
+def classify_profiled_kernel(name: str) -> str | None:
+    normalized = name.lower()
+    if "moea2a" in normalized:
+        if "dispatch" in normalized or "sanitizeexpertids" in normalized:
+            return "dispatch"
+        if "combine" in normalized:
+            return "combine"
+    if "mscclpp::ep::low_latency" in normalized:
+        if "dispatchkernel" in normalized:
+            return "dispatch"
+        if "combinekernel" in normalized or "combinetmaloadkernel" in normalized:
+            return "combine"
+    return None
+
+
+def summarize_profiled_replays(
+    profiler: torch.profiler.profile,
+    expected_replays: int,
+) -> Timing:
+    events = profiler.events()
+    launch_ids = [event.id for event in events if event.name == "cudaGraphLaunch"]
+    if len(launch_ids) != expected_replays:
+        raise RuntimeError(
+            f"Torch Profiler observed {len(launch_ids)} CUDA Graph launches; "
+            f"expected {expected_replays}"
+        )
+
+    launch_id_set = set(launch_ids)
+    kernels_by_launch: dict[int, list[Any]] = {
+        launch_id: [] for launch_id in launch_ids
+    }
+    for event in events:
+        if (
+            event.device_type == torch.autograd.DeviceType.CUDA
+            and event.id in launch_id_set
+        ):
+            kernels_by_launch[event.id].append(event)
+
+    replay_times: list[Timing] = []
+    for launch_id in launch_ids:
+        stage_times = {"dispatch": 0.0, "moe": 0.0, "combine": 0.0}
+        kernels = kernels_by_launch[launch_id]
+        markers = [classify_profiled_kernel(event.name) for event in kernels]
+        dispatch_indices = [
+            index for index, marker in enumerate(markers) if marker == "dispatch"
+        ]
+        combine_indices = [
+            index for index, marker in enumerate(markers) if marker == "combine"
+        ]
+        if not dispatch_indices or not combine_indices:
+            kernel_names = "\n".join(f"  {event.name}" for event in kernels)
+            raise RuntimeError(
+                "Torch Profiler could not identify dispatch/combine boundaries "
+                f"for a graph replay:\n{kernel_names}"
+            )
+        dispatch_end = max(dispatch_indices)
+        combine_begin = min(combine_indices)
+        if dispatch_end + 1 >= combine_begin:
+            raise RuntimeError("profiled dispatch, MoE, and combine kernels overlap")
+        for index, event in enumerate(kernels):
+            stage = (
+                "dispatch"
+                if index <= dispatch_end
+                else ("combine" if index >= combine_begin else "moe")
+            )
+            stage_times[stage] += float(event.self_device_time_total)
+        replay_times.append(
+            Timing(
+                dispatch_us=stage_times["dispatch"],
+                moe_us=stage_times["moe"],
+                combine_us=stage_times["combine"],
+                e2e_us=sum(stage_times.values()),
+            )
+        )
+
+    count = len(replay_times)
+    return Timing(
+        dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
+        moe_us=sum(item.moe_us for item in replay_times) / count,
+        combine_us=sum(item.combine_us for item in replay_times) / count,
+        e2e_us=sum(item.e2e_us for item in replay_times) / count,
     )
 
 
-def replay_and_clone(captured: CapturedPipeline) -> torch.Tensor:
-    dist.barrier()
-    captured.graph.replay()
-    output = captured.output.clone()
-    torch.cuda.synchronize()
-    dist.barrier()
-    return output
-
-
-def check_cuda_graph_correctness(
-    flashinfer_graph: CapturedPipeline,
-    mscclpp_graph: CapturedPipeline,
-    flashinfer_eager_output: torch.Tensor,
-    mscclpp_eager_output: torch.Tensor,
-    rtol: float,
-    atol: float,
-    device: torch.device,
-) -> tuple[float, float]:
-    flashinfer_graph_output = replay_and_clone(flashinfer_graph)
-    mscclpp_graph_output = replay_and_clone(mscclpp_graph)
-
-    assert_outputs_close(
-        reference=flashinfer_eager_output,
-        candidate=flashinfer_graph_output,
-        rtol=rtol,
-        atol=atol,
-        device=device,
-        label="FlashInfer eager and CUDA graph",
-    )
-    assert_outputs_close(
-        reference=mscclpp_eager_output,
-        candidate=mscclpp_graph_output,
-        rtol=rtol,
-        atol=atol,
-        device=device,
-        label="MSCCL++ eager and CUDA graph",
-    )
-    return assert_outputs_close(
-        reference=flashinfer_graph_output,
-        candidate=mscclpp_graph_output,
-        rtol=rtol,
-        atol=atol,
-        device=device,
-        label="FlashInfer CUDA graph and MSCCL++ CUDA graph",
-    )
-
-
-def benchmark_cuda_graph(
+def profile_pipeline_replays(
     captured: CapturedPipeline,
-    warmup: int,
     iters: int,
     device: torch.device,
-) -> Timing:
-    for _ in range(warmup):
-        captured.graph.replay()
+    sync_group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, Timing]:
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+    # Match SGLang decode: one complete forward is captured, then each decode
+    # step replays that graph once. Prime before collecting profiler activity.
+    captured.graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        acc_events=True,
+    ) as profiler:
+        # Kineto initialization time varies by process. Align after every rank's
+        # profiler is active so the first communication kernel does not measure
+        # another rank's profiler startup delay.
+        dist.barrier(group=sync_group)
+        for _ in range(iters):
+            captured.graph.replay()
         torch.cuda.synchronize()
-        dist.barrier()
 
-    dispatch_ms: list[float] = []
-    moe_ms: list[float] = []
-    combine_ms: list[float] = []
-    e2e_ms: list[float] = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        captured.graph.replay()
-        end.record()
-        end.synchronize()
-        dispatch_ms.append(captured.start.elapsed_time(captured.dispatch_end))
-        moe_ms.append(captured.dispatch_end.elapsed_time(captured.moe_end))
-        combine_ms.append(captured.moe_end.elapsed_time(captured.end))
-        e2e_ms.append(start.elapsed_time(end))
-        dist.barrier()
+    output = captured.output.clone()
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
 
-    dispatch_us, moe_us, combine_us, e2e_us = reduce_max(
+    local_timing = summarize_profiled_replays(profiler, iters)
+    dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(
         [
-            statistics.mean(dispatch_ms) * 1000,
-            statistics.mean(moe_ms) * 1000,
-            statistics.mean(combine_ms) * 1000,
-            statistics.mean(e2e_ms) * 1000,
+            local_timing.dispatch_us,
+            local_timing.moe_us,
+            local_timing.combine_us,
+            local_timing.e2e_us,
         ],
         device,
     )
-    return Timing(
-        dispatch_us=dispatch_us,
-        moe_us=moe_us,
-        combine_us=combine_us,
-        e2e_us=e2e_us,
+    if dist.get_rank() == 0:
+        print(
+            "Torch Profiler CUDA kernel time per production-style graph replay: "
+            f"dispatch={dispatch_us:.1f}us, MoE={moe_us:.1f}us, "
+            f"combine={combine_us:.1f}us, E2E={e2e_us:.1f}us",
+            flush=True,
+        )
+    return (
+        output,
+        Timing(
+            dispatch_us=dispatch_us,
+            moe_us=moe_us,
+            combine_us=combine_us,
+            e2e_us=e2e_us,
+        ),
     )
+
+
+def time_pipeline_replays(
+    captured: CapturedPipeline,
+    iters: int,
+    device: torch.device,
+    sync_group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, float]:
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+    captured.graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+    start = time.perf_counter()
+    for _ in range(iters):
+        captured.graph.replay()
+    torch.cuda.synchronize()
+    elapsed_us = (time.perf_counter() - start) * 1_000_000 / iters
+
+    output = captured.output.clone()
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    (e2e_us,) = reduce_mean([elapsed_us], device)
+    if dist.get_rank() == 0:
+        print(
+            f"Wall-clock E2E time per production-style graph replay: {e2e_us:.1f}us",
+            flush=True,
+        )
+    return output, e2e_us
 
 
 def format_markdown_table(rows: list[list[str]]) -> str:
@@ -906,12 +982,12 @@ def main() -> None:
     rank, world_size, _, cpu_group = initialize_distributed()
     validate_args(args, world_size)
     device = torch.device("cuda", torch.cuda.current_device())
+    mscclpp_comm_group = None
 
     try:
         import flashinfer
 
         mscclpp = None
-        mscclpp_comm_group = None
         if args.backend == "mscclpp":
             import mscclpp as imported_mscclpp
 
@@ -936,35 +1012,51 @@ def main() -> None:
                 f"hidden={args.hidden_size}, intermediate={args.intermediate_size}, "
                 f"experts={args.num_experts}, top_k={args.top_k}, "
                 f"tokens_per_rank={token_counts}, warmup={args.warmup}, "
-                f"iters={args.iters}, cuda_graph={args.cuda_graph}"
+                f"graph_replays={args.iters}, "
+                f"torch_profiler={not args.disable_torch_profiler}, "
+                f"moe_autotune={not args.skip_moe_autotune}"
             )
             versions = f"flashinfer={flashinfer.__version__}"
             if mscclpp is not None:
                 versions += f", mscclpp={mscclpp.__version__}"
             print(f"Versions: {versions}")
             print(f"Rank-local expert weights: {weight_gib:.2f} GiB")
-            print("Latency is the maximum per-rank mean GPU time.\n")
-            if args.cuda_graph:
-                print(
-                    "CUDA graph stages use embedded events and E2E uses outer "
-                    "events. Each value is independently max-reduced across "
-                    "ranks, so stage sums need not equal E2E.\n"
-                )
+            if args.disable_torch_profiler:
+                print("Wall-clock E2E time is averaged across ranks.\n")
+            else:
+                print("CUDA kernel time is averaged across per-rank profiler means.\n")
+            print(
+                "One complete dispatch->SGLang MoE runner->combine step is "
+                "captured, matching SGLang decode CUDA Graph boundaries. "
+                "After one unmeasured prime, repeated graph replays are timed.\n"
+            )
 
-        table = [
+        table = (
             [
-                "tokens/rank",
-                "global tokens",
-                "backend",
-                "mode",
-                "dispatch (us)",
-                "MoE (us)",
-                "combine (us)",
-                "E2E (us)",
-                "global tok/s",
-                "graph/eager max abs",
+                [
+                    "tokens/rank",
+                    "global tokens",
+                    "backend",
+                    "E2E (us)",
+                    "global tok/s",
+                    "graph/eager max abs",
+                ]
             ]
-        ]
+            if args.disable_torch_profiler
+            else [
+                [
+                    "tokens/rank",
+                    "global tokens",
+                    "backend",
+                    "dispatch kernel (us)",
+                    "MoE kernel (us)",
+                    "combine kernel (us)",
+                    "kernel sum (us)",
+                    "global tok/s (kernel)",
+                    "graph/eager max abs",
+                ]
+            ]
+        )
 
         for num_tokens in token_counts:
             inputs = make_inputs(args, rank, num_tokens, device)
@@ -991,6 +1083,19 @@ def main() -> None:
 
             torch.cuda.synchronize()
             dist.barrier()
+            if not args.skip_moe_autotune:
+                if rank == 0:
+                    print(
+                        "Autotuning FlashInfer CUTLASS MoE for "
+                        f"{world_size * num_tokens} dispatched rows...",
+                        flush=True,
+                    )
+                autotune_moe(
+                    pipeline=pipeline,
+                    inputs=inputs,
+                    dispatched_tokens=world_size * num_tokens,
+                    sync_group=cpu_group,
+                )
             eager_output = run_once(pipeline, inputs).clone()
             torch.cuda.synchronize()
             dist.barrier()
@@ -1005,61 +1110,60 @@ def main() -> None:
                     f"{pipeline.name} eager output contains NaN or Inf"
                 )
 
-            eager_timing = benchmark_pipeline(
+            graph = capture_pipeline(
                 pipeline=pipeline,
                 inputs=inputs,
                 warmup=args.warmup,
-                iters=args.iters,
-                device=device,
+                sync_group=cpu_group,
             )
-
-            graph = None
-            graph_output = None
-            graph_max_abs = None
-            graph_timing = None
-            if args.cuda_graph:
-                graph = capture_pipeline(pipeline, inputs)
-                graph_output = replay_and_clone(graph)
-                graph_max_abs, _ = assert_outputs_close(
-                    reference=eager_output,
-                    candidate=graph_output,
-                    rtol=args.rtol,
-                    atol=args.atol,
-                    device=device,
-                    label=f"{pipeline.name} eager and CUDA graph",
-                )
-                graph_timing = benchmark_cuda_graph(
+            if args.disable_torch_profiler:
+                graph_output, graph_e2e_us = time_pipeline_replays(
                     captured=graph,
-                    warmup=args.warmup,
                     iters=args.iters,
                     device=device,
+                    sync_group=cpu_group,
                 )
+            else:
+                graph_output, graph_timing = profile_pipeline_replays(
+                    captured=graph,
+                    iters=args.iters,
+                    device=device,
+                    sync_group=cpu_group,
+                )
+            graph_max_abs, _ = assert_outputs_close(
+                reference=eager_output,
+                candidate=graph_output,
+                rtol=args.rtol,
+                atol=args.atol,
+                device=device,
+                label=f"{pipeline.name} eager and CUDA graph",
+            )
 
             if rank == 0:
                 global_tokens = num_tokens * world_size
-                eager_throughput = global_tokens * 1_000_000 / eager_timing.e2e_us
-                table.append(
-                    [
-                        str(num_tokens),
-                        str(global_tokens),
-                        pipeline.name,
-                        "eager",
-                        f"{eager_timing.dispatch_us:.1f}",
-                        f"{eager_timing.moe_us:.1f}",
-                        f"{eager_timing.combine_us:.1f}",
-                        f"{eager_timing.e2e_us:.1f}",
-                        f"{eager_throughput:,.0f}",
-                        "-",
-                    ]
-                )
-                if graph_timing is not None and graph_max_abs is not None:
+                if args.disable_torch_profiler:
+                    graph_throughput = global_tokens * 1_000_000 / graph_e2e_us
+                    table.append(
+                        [
+                            str(num_tokens),
+                            str(global_tokens),
+                            pipeline.name,
+                            f"{graph_e2e_us:.1f}",
+                            f"{graph_throughput:,.0f}",
+                            f"{graph_max_abs:.3g}",
+                        ]
+                    )
+                    print(
+                        f"Finished backend={args.backend} tokens_per_rank={num_tokens}: "
+                        f"Graph E2E={graph_e2e_us:.1f}us"
+                    )
+                else:
                     graph_throughput = global_tokens * 1_000_000 / graph_timing.e2e_us
                     table.append(
                         [
                             str(num_tokens),
                             str(global_tokens),
                             pipeline.name,
-                            "cuda_graph",
                             f"{graph_timing.dispatch_us:.1f}",
                             f"{graph_timing.moe_us:.1f}",
                             f"{graph_timing.combine_us:.1f}",
@@ -1068,14 +1172,13 @@ def main() -> None:
                             f"{graph_max_abs:.3g}",
                         ]
                     )
-                print(
-                    f"Finished backend={args.backend} tokens_per_rank={num_tokens}: "
-                    f"E2E={eager_timing.e2e_us:.1f}us"
-                )
+                    print(
+                        f"Finished backend={args.backend} tokens_per_rank={num_tokens}: "
+                        f"Graph kernel sum={graph_timing.e2e_us:.1f}us"
+                    )
 
             torch.cuda.synchronize()
-            if graph is not None:
-                graph.graph.reset()
+            graph.graph.reset()
             if args.backend == "flashinfer":
                 pipeline.close()
             del (
@@ -1087,13 +1190,15 @@ def main() -> None:
             )
             gc.collect()
             torch.cuda.empty_cache()
-            dist.barrier()
+            synchronize_stream_and_ranks(mscclpp_comm_group, cpu_group)
 
         if rank == 0:
             print()
             print(format_markdown_table(table))
+        synchronize_stream_and_ranks(mscclpp_comm_group, cpu_group)
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
