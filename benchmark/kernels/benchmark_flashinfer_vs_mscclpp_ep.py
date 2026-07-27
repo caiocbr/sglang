@@ -85,6 +85,17 @@ class Timing:
 
 
 @dataclass
+class TimelineTiming:
+    dispatch_span_us: float
+    dispatch_moe_gap_us: float
+    moe_span_us: float
+    moe_combine_gap_us: float
+    combine_span_us: float
+    e2e_span_us: float
+    device_idle_us: float
+
+
+@dataclass
 class ExpertWeights:
     w13: torch.Tensor
     w2: torch.Tensor
@@ -94,6 +105,11 @@ class ExpertWeights:
 class CapturedPipeline:
     graph: torch.cuda.CUDAGraph
     output: torch.Tensor
+    operations_per_replay: int = 1
+    start: torch.cuda.Event | None = None
+    dispatch_end: torch.cuda.Event | None = None
+    moe_end: torch.cuda.Event | None = None
+    end: torch.cuda.Event | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +141,32 @@ def parse_args() -> argparse.Namespace:
         "--disable-torch-profiler",
         action="store_true",
         help="Report wall-clock E2E time per graph replay instead of per-stage CUDA kernel time.",
+    )
+    parser.add_argument(
+        "--wall-clock-repeats",
+        type=int,
+        default=1,
+        help="Number of wall-clock measurement rounds; median is reported.",
+    )
+    parser.add_argument(
+        "--routing-samples",
+        type=int,
+        default=1,
+        help="Number of independently routed single-step graphs cycled during wall-clock timing.",
+    )
+    parser.add_argument(
+        "--graph-group-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of independently routed full pipeline iterations captured in one "
+            "CUDA Graph replay; wall-clock results are divided by this value."
+        ),
+    )
+    parser.add_argument(
+        "--report-stage-events",
+        action="store_true",
+        help="Record external CUDA events inside each full graph and report stage intervals.",
     )
     parser.add_argument(
         "--skip-moe-autotune",
@@ -219,6 +261,34 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--intermediate-size must be positive")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be non-negative and --iters must be positive")
+    if args.wall_clock_repeats <= 0:
+        raise ValueError("--wall-clock-repeats must be positive")
+    if args.graph_group_size <= 0:
+        raise ValueError("--graph-group-size must be positive")
+    if not 0 < args.routing_samples <= args.iters:
+        raise ValueError("--routing-samples must be in [1, iters]")
+    if not args.disable_torch_profiler and args.wall_clock_repeats != 1:
+        raise ValueError("--wall-clock-repeats requires --disable-torch-profiler")
+    if not args.disable_torch_profiler and args.routing_samples != 1:
+        raise ValueError("--routing-samples requires --disable-torch-profiler")
+    if args.report_stage_events and not args.disable_torch_profiler:
+        raise ValueError("--report-stage-events requires --disable-torch-profiler")
+    if args.report_stage_events and args.iters % args.routing_samples != 0:
+        raise ValueError(
+            "--report-stage-events requires iters divisible by routing-samples"
+        )
+    if args.graph_group_size > 1:
+        if not args.disable_torch_profiler:
+            raise ValueError("--graph-group-size > 1 requires --disable-torch-profiler")
+        if args.routing_samples != 1:
+            raise ValueError(
+                "--graph-group-size generates its own independent routing samples; "
+                "leave --routing-samples at 1"
+            )
+        if args.report_stage_events:
+            raise ValueError(
+                "--report-stage-events is not supported with --graph-group-size > 1"
+            )
     if args.backend == "mscclpp":
         min_blocks = world_size + 2
         if not min_blocks <= args.low_latency_num_blocks <= 130:
@@ -266,9 +336,12 @@ def make_inputs(
     rank: int,
     num_tokens: int,
     device: torch.device,
+    sample_index: int = 0,
 ) -> Inputs:
     generator = torch.Generator(device=device)
-    generator.manual_seed(args.seed + 1_000_003 * rank + num_tokens)
+    generator.manual_seed(
+        args.seed + 1_000_003 * rank + 10_000_019 * sample_index + num_tokens
+    )
 
     hidden_states = torch.empty(
         (num_tokens, args.hidden_size), dtype=DTYPE, device=device
@@ -769,19 +842,70 @@ def capture_pipeline(
     inputs: Inputs,
     warmup: int,
     sync_group: dist.ProcessGroup,
+    record_stage_events: bool = False,
 ) -> CapturedPipeline:
     for _ in range(warmup):
         run_once(pipeline, inputs)
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
+    events = (
+        [torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)]
+        if record_stage_events
+        else [None] * 4
+    )
+    start, dispatch_end, moe_end, end = events
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = run_once(pipeline, inputs)
+        if start is not None:
+            start.record()
+        state = pipeline.dispatch(inputs)
+        if dispatch_end is not None:
+            dispatch_end.record()
+        expert_output = pipeline.run_moe(state)
+        if moe_end is not None:
+            moe_end.record()
+        output = pipeline.combine(state, expert_output)
+        if end is not None:
+            end.record()
 
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
-    return CapturedPipeline(graph=graph, output=output)
+    return CapturedPipeline(
+        graph=graph,
+        output=output,
+        start=start,
+        dispatch_end=dispatch_end,
+        moe_end=moe_end,
+        end=end,
+    )
+
+
+def capture_grouped_pipeline(
+    pipeline: Any,
+    input_samples: list[Inputs],
+    warmup: int,
+    sync_group: dist.ProcessGroup,
+) -> CapturedPipeline:
+    if len(input_samples) <= 1:
+        raise ValueError("grouped pipeline capture requires at least two input samples")
+    for index in range(warmup):
+        run_once(pipeline, input_samples[index % len(input_samples)])
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for inputs in input_samples:
+            output = run_once(pipeline, inputs)
+
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    return CapturedPipeline(
+        graph=graph,
+        output=output,
+        operations_per_replay=len(input_samples),
+    )
 
 
 def classify_profiled_kernel(name: str) -> str | None:
@@ -802,7 +926,7 @@ def classify_profiled_kernel(name: str) -> str | None:
 def summarize_profiled_replays(
     profiler: torch.profiler.profile,
     expected_replays: int,
-) -> Timing:
+) -> tuple[Timing, TimelineTiming]:
     events = profiler.events()
     launch_ids = [event.id for event in events if event.name == "cudaGraphLaunch"]
     if len(launch_ids) != expected_replays:
@@ -823,9 +947,13 @@ def summarize_profiled_replays(
             kernels_by_launch[event.id].append(event)
 
     replay_times: list[Timing] = []
+    replay_timelines: list[TimelineTiming] = []
     for launch_id in launch_ids:
         stage_times = {"dispatch": 0.0, "moe": 0.0, "combine": 0.0}
-        kernels = kernels_by_launch[launch_id]
+        kernels = sorted(
+            kernels_by_launch[launch_id],
+            key=lambda event: (event.time_range.start, event.time_range.end),
+        )
         markers = [classify_profiled_kernel(event.name) for event in kernels]
         dispatch_indices = [
             index for index, marker in enumerate(markers) if marker == "dispatch"
@@ -843,6 +971,13 @@ def summarize_profiled_replays(
         combine_begin = min(combine_indices)
         if dispatch_end + 1 >= combine_begin:
             raise RuntimeError("profiled dispatch, MoE, and combine kernels overlap")
+        stage_kernels = {
+            "dispatch": kernels[: dispatch_end + 1],
+            "moe": kernels[dispatch_end + 1 : combine_begin],
+            "combine": kernels[combine_begin:],
+        }
+        if not stage_kernels["moe"]:
+            raise RuntimeError("profiled graph contains no MoE kernels")
         for index, event in enumerate(kernels):
             stage = (
                 "dispatch"
@@ -858,13 +993,56 @@ def summarize_profiled_replays(
                 e2e_us=sum(stage_times.values()),
             )
         )
+        dispatch_start = stage_kernels["dispatch"][0].time_range.start
+        dispatch_stop = max(
+            event.time_range.end for event in stage_kernels["dispatch"]
+        )
+        moe_start = min(event.time_range.start for event in stage_kernels["moe"])
+        moe_stop = max(event.time_range.end for event in stage_kernels["moe"])
+        combine_start = min(
+            event.time_range.start for event in stage_kernels["combine"]
+        )
+        combine_stop = max(
+            event.time_range.end for event in stage_kernels["combine"]
+        )
+        busy_intervals = sorted(
+            (event.time_range.start, event.time_range.end) for event in kernels
+        )
+        busy_us = 0.0
+        busy_start, busy_stop = busy_intervals[0]
+        for interval_start, interval_stop in busy_intervals[1:]:
+            if interval_start > busy_stop:
+                busy_us += busy_stop - busy_start
+                busy_start, busy_stop = interval_start, interval_stop
+            else:
+                busy_stop = max(busy_stop, interval_stop)
+        busy_us += busy_stop - busy_start
+        replay_timelines.append(
+            TimelineTiming(
+                dispatch_span_us=dispatch_stop - dispatch_start,
+                dispatch_moe_gap_us=moe_start - dispatch_stop,
+                moe_span_us=moe_stop - moe_start,
+                moe_combine_gap_us=combine_start - moe_stop,
+                combine_span_us=combine_stop - combine_start,
+                e2e_span_us=combine_stop - dispatch_start,
+                device_idle_us=combine_stop - dispatch_start - busy_us,
+            )
+        )
 
     count = len(replay_times)
-    return Timing(
-        dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
-        moe_us=sum(item.moe_us for item in replay_times) / count,
-        combine_us=sum(item.combine_us for item in replay_times) / count,
-        e2e_us=sum(item.e2e_us for item in replay_times) / count,
+    return (
+        Timing(
+            dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
+            moe_us=sum(item.moe_us for item in replay_times) / count,
+            combine_us=sum(item.combine_us for item in replay_times) / count,
+            e2e_us=sum(item.e2e_us for item in replay_times) / count,
+        ),
+        TimelineTiming(
+            *(
+                sum(getattr(item, field) for item in replay_timelines) / count
+                for field in TimelineTiming.__dataclass_fields__
+            )
+        ),
     )
 
 
@@ -901,7 +1079,7 @@ def profile_pipeline_replays(
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
-    local_timing = summarize_profiled_replays(profiler, iters)
+    local_timing, local_timeline = summarize_profiled_replays(profiler, iters)
     dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(
         [
             local_timing.dispatch_us,
@@ -911,11 +1089,46 @@ def profile_pipeline_replays(
         ],
         device,
     )
+    timeline_mean = reduce_mean(
+        [
+            local_timeline.dispatch_span_us,
+            local_timeline.dispatch_moe_gap_us,
+            local_timeline.moe_span_us,
+            local_timeline.moe_combine_gap_us,
+            local_timeline.combine_span_us,
+            local_timeline.e2e_span_us,
+            local_timeline.device_idle_us,
+        ],
+        device,
+    )
+    timeline_max = reduce_max(
+        [
+            local_timeline.dispatch_span_us,
+            local_timeline.dispatch_moe_gap_us,
+            local_timeline.moe_span_us,
+            local_timeline.moe_combine_gap_us,
+            local_timeline.combine_span_us,
+            local_timeline.e2e_span_us,
+            local_timeline.device_idle_us,
+        ],
+        device,
+    )
     if dist.get_rank() == 0:
         print(
             "Torch Profiler CUDA kernel time per production-style graph replay: "
             f"dispatch={dispatch_us:.1f}us, MoE={moe_us:.1f}us, "
             f"combine={combine_us:.1f}us, E2E={e2e_us:.1f}us",
+            flush=True,
+        )
+        print(
+            "Torch Profiler CUDA timeline mean/max per graph replay: "
+            f"dispatch_span={timeline_mean[0]:.1f}/{timeline_max[0]:.1f}us, "
+            f"dispatch_to_MoE_gap={timeline_mean[1]:.1f}/{timeline_max[1]:.1f}us, "
+            f"MoE_span={timeline_mean[2]:.1f}/{timeline_max[2]:.1f}us, "
+            f"MoE_to_combine_gap={timeline_mean[3]:.1f}/{timeline_max[3]:.1f}us, "
+            f"combine_span={timeline_mean[4]:.1f}/{timeline_max[4]:.1f}us, "
+            f"device_graph_span={timeline_mean[5]:.1f}/{timeline_max[5]:.1f}us, "
+            f"device_idle={timeline_mean[6]:.1f}/{timeline_max[6]:.1f}us",
             flush=True,
         )
     return (
@@ -930,33 +1143,112 @@ def profile_pipeline_replays(
 
 
 def time_pipeline_replays(
-    captured: CapturedPipeline,
+    captured: CapturedPipeline | list[CapturedPipeline],
     iters: int,
+    repeats: int,
     device: torch.device,
     sync_group: dist.ProcessGroup,
+    report_stage_events: bool = False,
 ) -> tuple[torch.Tensor, float]:
+    captured_graphs = captured if isinstance(captured, list) else [captured]
+    operations_per_replay = captured_graphs[0].operations_per_replay
+    if any(
+        item.operations_per_replay != operations_per_replay
+        for item in captured_graphs
+    ):
+        raise ValueError("all cycled CUDA Graphs must contain the same operation count")
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
-    captured.graph.replay()
+    for item in captured_graphs:
+        item.graph.replay()
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
-    start = time.perf_counter()
-    for _ in range(iters):
-        captured.graph.replay()
-    torch.cuda.synchronize()
-    elapsed_us = (time.perf_counter() - start) * 1_000_000 / iters
-
-    output = captured.output.clone()
-    torch.cuda.synchronize()
-    dist.barrier(group=sync_group)
-    (e2e_us,) = reduce_mean([elapsed_us], device)
-    if dist.get_rank() == 0:
-        print(
-            f"Wall-clock E2E time per production-style graph replay: {e2e_us:.1f}us",
-            flush=True,
+    round_us = []
+    stage_rounds = []
+    for _ in range(repeats):
+        dist.barrier(group=sync_group)
+        start = time.perf_counter()
+        for index in range(iters):
+            captured_graphs[index % len(captured_graphs)].graph.replay()
+        torch.cuda.synchronize()
+        elapsed_us = (
+            (time.perf_counter() - start)
+            * 1_000_000
+            / iters
+            / operations_per_replay
         )
+        (elapsed_us,) = reduce_mean([elapsed_us], device)
+        round_us.append(elapsed_us)
+        if report_stage_events:
+            local_stage_timings = [
+                Timing(
+                    dispatch_us=item.start.elapsed_time(item.dispatch_end) * 1e3,
+                    moe_us=item.dispatch_end.elapsed_time(item.moe_end) * 1e3,
+                    combine_us=item.moe_end.elapsed_time(item.end) * 1e3,
+                    e2e_us=item.start.elapsed_time(item.end) * 1e3,
+                )
+                for item in captured_graphs
+            ]
+            count = len(local_stage_timings)
+            local_mean = Timing(
+                dispatch_us=sum(item.dispatch_us for item in local_stage_timings)
+                / count,
+                moe_us=sum(item.moe_us for item in local_stage_timings) / count,
+                combine_us=sum(item.combine_us for item in local_stage_timings) / count,
+                e2e_us=sum(item.e2e_us for item in local_stage_timings) / count,
+            )
+            stage_rounds.append(
+                Timing(
+                    *reduce_mean(
+                        [
+                            local_mean.dispatch_us,
+                            local_mean.moe_us,
+                            local_mean.combine_us,
+                            local_mean.e2e_us,
+                        ],
+                        device,
+                    )
+                )
+            )
+
+    output = captured_graphs[(iters - 1) % len(captured_graphs)].output.clone()
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    e2e_us = sorted(round_us)[len(round_us) // 2]
+    if dist.get_rank() == 0:
+        if operations_per_replay > 1:
+            print(
+                "Grouped CUDA Graph wall-clock E2E: "
+                f"graph_replays={iters}, iterations_per_replay={operations_per_replay}, "
+                f"total_iterations={iters * operations_per_replay}, "
+                f"per_replay={e2e_us * operations_per_replay:.1f}us, "
+                f"per_iteration_median={e2e_us:.1f}us "
+                f"min={min(round_us):.1f}us max={max(round_us):.1f}us rounds="
+                f"{','.join(f'{value:.1f}' for value in round_us)}",
+                flush=True,
+            )
+        else:
+            print(
+                "Wall-clock E2E time per production-style graph replay: "
+                f"median={e2e_us:.1f}us min={min(round_us):.1f}us "
+                f"max={max(round_us):.1f}us rounds="
+                f"{','.join(f'{value:.1f}' for value in round_us)}",
+                flush=True,
+            )
+        if stage_rounds:
+            median_round = sorted(
+                range(len(round_us)), key=lambda index: round_us[index]
+            )[len(round_us) // 2]
+            stage = stage_rounds[median_round]
+            print(
+                "Embedded CUDA Graph stage intervals at median wall-clock round: "
+                f"dispatch={stage.dispatch_us:.1f}us, MoE={stage.moe_us:.1f}us, "
+                f"combine={stage.combine_us:.1f}us, device_graph={stage.e2e_us:.1f}us, "
+                f"host_minus_device={e2e_us - stage.e2e_us:.1f}us",
+                flush=True,
+            )
     return output, e2e_us
 
 
@@ -1012,7 +1304,8 @@ def main() -> None:
                 f"hidden={args.hidden_size}, intermediate={args.intermediate_size}, "
                 f"experts={args.num_experts}, top_k={args.top_k}, "
                 f"tokens_per_rank={token_counts}, warmup={args.warmup}, "
-                f"graph_replays={args.iters}, "
+                f"graph_replays={args.iters}, routing_samples={args.routing_samples}, "
+                f"graph_group_size={args.graph_group_size}, "
                 f"torch_profiler={not args.disable_torch_profiler}, "
                 f"moe_autotune={not args.skip_moe_autotune}"
             )
@@ -1025,11 +1318,19 @@ def main() -> None:
                 print("Wall-clock E2E time is averaged across ranks.\n")
             else:
                 print("CUDA kernel time is averaged across per-rank profiler means.\n")
-            print(
-                "One complete dispatch->SGLang MoE runner->combine step is "
-                "captured, matching SGLang decode CUDA Graph boundaries. "
-                "After one unmeasured prime, repeated graph replays are timed.\n"
-            )
+            if args.graph_group_size > 1:
+                print(
+                    f"One CUDA Graph contains {args.graph_group_size} independent-routing "
+                    "dispatch->SGLang MoE runner->combine iterations. After one "
+                    "unmeasured graph replay, repeated graph replays are timed and "
+                    "reported per iteration.\n"
+                )
+            else:
+                print(
+                    "One complete dispatch->SGLang MoE runner->combine step is "
+                    "captured, matching SGLang decode CUDA Graph boundaries. "
+                    "After one unmeasured prime, repeated graph replays are timed.\n"
+                )
 
         table = (
             [
@@ -1059,7 +1360,16 @@ def main() -> None:
         )
 
         for num_tokens in token_counts:
-            inputs = make_inputs(args, rank, num_tokens, device)
+            input_sample_count = (
+                args.graph_group_size
+                if args.graph_group_size > 1
+                else args.routing_samples
+            )
+            routing_inputs = [
+                make_inputs(args, rank, num_tokens, device, sample_index)
+                for sample_index in range(input_sample_count)
+            ]
+            inputs = routing_inputs[0]
             if args.backend == "flashinfer":
                 pipeline = FlashInferPipeline(
                     args=args,
@@ -1096,48 +1406,102 @@ def main() -> None:
                     dispatched_tokens=world_size * num_tokens,
                     sync_group=cpu_group,
                 )
-            eager_output = run_once(pipeline, inputs).clone()
-            torch.cuda.synchronize()
-            dist.barrier()
-            finite = torch.tensor(
-                int(torch.isfinite(eager_output).all()),
-                dtype=torch.int32,
-                device=device,
-            )
-            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-            if not bool(finite.item()):
-                raise AssertionError(
-                    f"{pipeline.name} eager output contains NaN or Inf"
-                )
 
-            graph = capture_pipeline(
-                pipeline=pipeline,
-                inputs=inputs,
-                warmup=args.warmup,
-                sync_group=cpu_group,
-            )
+            captured_graphs = []
+            graph_max_abs = 0.0
+            if args.graph_group_size > 1:
+                for sample_inputs in routing_inputs:
+                    eager_output = run_once(pipeline, sample_inputs)
+                eager_output = eager_output.clone()
+                torch.cuda.synchronize()
+                dist.barrier()
+                finite = torch.tensor(
+                    int(torch.isfinite(eager_output).all()),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                if not bool(finite.item()):
+                    raise AssertionError(
+                        f"{pipeline.name} eager output contains NaN or Inf"
+                    )
+
+                captured = capture_grouped_pipeline(
+                    pipeline=pipeline,
+                    input_samples=routing_inputs,
+                    warmup=args.warmup,
+                    sync_group=cpu_group,
+                )
+                captured.graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                graph_output = captured.output.clone()
+                sample_max_abs, _ = assert_outputs_close(
+                    reference=eager_output,
+                    candidate=graph_output,
+                    rtol=args.rtol,
+                    atol=args.atol,
+                    device=device,
+                    label=f"{pipeline.name} eager and grouped CUDA graph",
+                )
+                graph_max_abs = sample_max_abs
+                captured_graphs.append(captured)
+                del eager_output, graph_output
+            else:
+                for sample_index, sample_inputs in enumerate(routing_inputs):
+                    eager_output = run_once(pipeline, sample_inputs).clone()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    finite = torch.tensor(
+                        int(torch.isfinite(eager_output).all()),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                    if not bool(finite.item()):
+                        raise AssertionError(
+                            f"{pipeline.name} eager output contains NaN or Inf"
+                        )
+
+                    captured = capture_pipeline(
+                        pipeline=pipeline,
+                        inputs=sample_inputs,
+                        warmup=args.warmup if sample_index == 0 else 0,
+                        sync_group=cpu_group,
+                        record_stage_events=args.report_stage_events,
+                    )
+                    captured.graph.replay()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    graph_output = captured.output.clone()
+                    sample_max_abs, _ = assert_outputs_close(
+                        reference=eager_output,
+                        candidate=graph_output,
+                        rtol=args.rtol,
+                        atol=args.atol,
+                        device=device,
+                        label=f"{pipeline.name} eager and CUDA graph sample {sample_index}",
+                    )
+                    graph_max_abs = max(graph_max_abs, sample_max_abs)
+                    captured_graphs.append(captured)
+                    del eager_output, graph_output
+
             if args.disable_torch_profiler:
-                graph_output, graph_e2e_us = time_pipeline_replays(
-                    captured=graph,
+                _, graph_e2e_us = time_pipeline_replays(
+                    captured=captured_graphs,
                     iters=args.iters,
+                    repeats=args.wall_clock_repeats,
                     device=device,
                     sync_group=cpu_group,
+                    report_stage_events=args.report_stage_events,
                 )
             else:
-                graph_output, graph_timing = profile_pipeline_replays(
-                    captured=graph,
+                _, graph_timing = profile_pipeline_replays(
+                    captured=captured_graphs[0],
                     iters=args.iters,
                     device=device,
                     sync_group=cpu_group,
                 )
-            graph_max_abs, _ = assert_outputs_close(
-                reference=eager_output,
-                candidate=graph_output,
-                rtol=args.rtol,
-                atol=args.atol,
-                device=device,
-                label=f"{pipeline.name} eager and CUDA graph",
-            )
 
             if rank == 0:
                 global_tokens = num_tokens * world_size
@@ -1176,17 +1540,16 @@ def main() -> None:
                         f"Finished backend={args.backend} tokens_per_rank={num_tokens}: "
                         f"Graph kernel sum={graph_timing.e2e_us:.1f}us"
                     )
-
             torch.cuda.synchronize()
-            graph.graph.reset()
+            torch.cuda.synchronize()
+            for captured in captured_graphs:
+                captured.graph.reset()
             if args.backend == "flashinfer":
                 pipeline.close()
             del (
                 pipeline,
-                eager_output,
-                graph_output,
-                graph,
-                inputs,
+                captured_graphs,
+                routing_inputs,
             )
             gc.collect()
             torch.cuda.empty_cache()
