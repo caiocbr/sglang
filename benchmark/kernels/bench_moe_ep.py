@@ -24,7 +24,7 @@ report per-stage CUDA kernel time instead of wall-clock time.
 Example on one 8-GPU node:
 
     torchrun --standalone --nproc-per-node=8 \
-      benchmark/kernels/benchmark_flashinfer_vs_mscclpp_ep.py --backend mscclpp
+      benchmark/kernels/bench_moe_ep.py --backend mscclpp
 
 All participating GPUs must belong to the same NVIDIA Fabric cluster.
 """
