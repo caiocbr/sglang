@@ -19,7 +19,9 @@ By default one CUDA Graph captures ``--iters-per-graph`` independently routed
 reported over ``--graph-replays`` replays. Capturing many iterations amortizes
 launch overhead and averages over routing variation. Pass ``--iters-per-graph 1``
 to match SGLang decode CUDA Graph boundaries, and add ``--torch-profiler`` to
-report per-stage CUDA kernel time instead of wall-clock time.
+report per-stage and per-kernel CUDA time instead of wall-clock time. Profiling
+honours ``--iters-per-graph``; keep it high so the spin-waiting dispatch and
+combine kernels are not inflated by per-replay launch skew.
 
 Example on one 8-GPU node:
 
@@ -207,11 +209,6 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--warmup-replays must be non-negative")
     if args.iters_per_graph <= 0:
         raise ValueError("--iters-per-graph must be positive")
-    if args.torch_profiler and args.iters_per_graph != 1:
-        raise ValueError(
-            "--torch-profiler attributes kernels to one dispatch/MoE/combine "
-            "boundary, so it requires --iters-per-graph 1"
-        )
 
 
 def make_local_weights(
@@ -720,8 +717,8 @@ def classify_profiled_kernel(name: str) -> str | None:
 class KernelStat:
     stage: str
     name: str
-    launches_per_replay: float
-    total_us_per_replay: float
+    launches_per_iteration: float
+    total_us_per_iteration: float
 
 
 def summarize_profiled_replays(
@@ -749,61 +746,74 @@ def summarize_profiled_replays(
 
     replay_times: list[Timing] = []
     kernel_totals: dict[tuple[str, str], list[float]] = {}
+    iterations_seen: list[int] = []
     for launch_id in launch_ids:
         stage_times = {"dispatch": 0.0, "moe": 0.0, "combine": 0.0}
         kernels = sorted(
             kernels_by_launch[launch_id],
             key=lambda event: (event.time_range.start, event.time_range.end),
         )
-        markers = [classify_profiled_kernel(event.name) for event in kernels]
-        dispatch_indices = [
-            index for index, marker in enumerate(markers) if marker == "dispatch"
-        ]
-        combine_indices = [
-            index for index, marker in enumerate(markers) if marker == "combine"
-        ]
-        if not dispatch_indices or not combine_indices:
-            kernel_names = "\n".join(f"  {event.name}" for event in kernels)
-            raise RuntimeError(
-                "Torch Profiler could not identify dispatch/combine boundaries "
-                f"for a graph replay:\n{kernel_names}"
-            )
-        dispatch_end = max(dispatch_indices)
-        combine_begin = min(combine_indices)
-        if dispatch_end + 1 >= combine_begin:
-            raise RuntimeError("profiled dispatch, MoE, and combine kernels overlap")
-        for index, event in enumerate(kernels):
-            stage = (
-                "dispatch"
-                if index <= dispatch_end
-                else ("combine" if index >= combine_begin else "moe")
-            )
+        # A graph may contain many dispatch -> MoE -> combine iterations, so
+        # walk the kernels as a state machine instead of assuming one boundary
+        # pair. An unclassified kernel belongs to MoE only when it follows
+        # dispatch; anything after combine starts the next iteration.
+        stage = None
+        iterations = 0
+        for event in kernels:
+            marker = classify_profiled_kernel(event.name)
+            if marker == "dispatch":
+                if stage != "dispatch":
+                    iterations += 1
+                stage = "dispatch"
+            elif marker == "combine":
+                stage = "combine"
+            elif stage == "dispatch":
+                stage = "moe"
+            elif stage is None:
+                kernel_names = "\n".join(f"  {item.name}" for item in kernels)
+                raise RuntimeError(
+                    "Torch Profiler saw a kernel before any dispatch kernel in "
+                    f"a graph replay:\n{kernel_names}"
+                )
             stage_times[stage] += float(event.self_device_time_total)
             entry = kernel_totals.setdefault((stage, event.name), [0.0, 0.0])
             entry[0] += 1.0
             entry[1] += float(event.self_device_time_total)
+        if iterations == 0 or stage != "combine":
+            kernel_names = "\n".join(f"  {item.name}" for item in kernels)
+            raise RuntimeError(
+                "Torch Profiler could not identify dispatch/combine boundaries "
+                f"for a graph replay:\n{kernel_names}"
+            )
+        iterations_seen.append(iterations)
         replay_times.append(
             Timing(
-                dispatch_us=stage_times["dispatch"],
-                moe_us=stage_times["moe"],
-                combine_us=stage_times["combine"],
-                e2e_us=sum(stage_times.values()),
+                dispatch_us=stage_times["dispatch"] / iterations,
+                moe_us=stage_times["moe"] / iterations,
+                combine_us=stage_times["combine"] / iterations,
+                e2e_us=sum(stage_times.values()) / iterations,
             )
         )
 
+    if len(set(iterations_seen)) != 1:
+        raise RuntimeError(
+            f"graph replays contained differing iteration counts: {sorted(set(iterations_seen))}"
+        )
+
     count = len(replay_times)
+    samples = count * iterations_seen[0]
     stage_order = {"dispatch": 0, "moe": 1, "combine": 2}
     kernel_stats = [
         KernelStat(
             stage=stage,
             name=name,
-            launches_per_replay=totals[0] / count,
-            total_us_per_replay=totals[1] / count,
+            launches_per_iteration=totals[0] / samples,
+            total_us_per_iteration=totals[1] / samples,
         )
         for (stage, name), totals in kernel_totals.items()
     ]
     kernel_stats.sort(
-        key=lambda stat: (stage_order[stat.stage], -stat.total_us_per_replay)
+        key=lambda stat: (stage_order[stat.stage], -stat.total_us_per_iteration)
     )
     timing = Timing(
         dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
@@ -850,7 +860,7 @@ def profile_graph_replays(
     )
     if dist.get_rank() == 0:
         print(
-            "Torch Profiler CUDA kernel time per graph replay: "
+            "Torch Profiler CUDA kernel time per MoE iteration: "
             f"dispatch={dispatch_us:.1f}us, MoE={moe_us:.1f}us, "
             f"combine={combine_us:.1f}us, sum={e2e_us:.1f}us",
             flush=True,
@@ -866,21 +876,21 @@ def profile_graph_replays(
 
 def print_kernel_table(kernel_stats: list[KernelStat], timing: Timing) -> None:
     total = timing.e2e_us
-    rows = [["stage", "kernel", "launches/replay", "us/replay", "% of total"]]
+    rows = [["stage", "kernel", "launches/iter", "us/iter", "% of total"]]
     for stat in kernel_stats:
-        share = 100.0 * stat.total_us_per_replay / total if total > 0 else 0.0
+        share = 100.0 * stat.total_us_per_iteration / total if total > 0 else 0.0
         rows.append(
             [
                 stat.stage,
                 stat.name,
-                f"{stat.launches_per_replay:.1f}",
-                f"{stat.total_us_per_replay:.2f}",
+                f"{stat.launches_per_iteration:.1f}",
+                f"{stat.total_us_per_iteration:.2f}",
                 f"{share:.1f}",
             ]
         )
     print(
-        "\nRank-0 per-kernel CUDA time inside one graph replay "
-        "(self device time, averaged over replays):",
+        "\nRank-0 per-kernel CUDA time per MoE iteration "
+        "(self device time, averaged over all profiled iterations):",
         flush=True,
     )
     print(format_markdown_table(rows), flush=True)
