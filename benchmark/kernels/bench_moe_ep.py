@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -139,6 +140,13 @@ def parse_args() -> argparse.Namespace:
         "--skip-moe-autotune",
         action="store_true",
         help="Use FlashInfer CUTLASS fallback tactics instead of exact-shape autotuning.",
+    )
+    parser.add_argument(
+        "--per-rank-moe-autotune",
+        action="store_true",
+        help="Autotune independently on every rank instead of broadcasting rank 0's "
+        "tactics. Ranks that mis-time a candidate become stragglers and, because "
+        "dispatch and combine are barriers, stall every peer.",
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
@@ -571,13 +579,50 @@ def autotune_moe(
     inputs: Inputs,
     dispatched_tokens: int,
     sync_group: dist.ProcessGroup,
+    per_rank: bool = False,
 ) -> None:
-    from flashinfer.autotuner import autotune
+    from flashinfer.autotuner import AutoTuner, autotune
 
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
+    # Tuning replays the whole pipeline, including the collective dispatch and
+    # combine, so every rank has to run the tuning pass in lockstep.
     with autotune(True, tuning_buckets=(dispatched_tokens,)):
         run_once(pipeline, inputs)
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    if per_rank:
+        return
+
+    # Every rank tunes the same shapes, so independent picks only add noise: a
+    # rank that mis-times one candidate keeps a slower tactic for the whole run
+    # and, because dispatch and combine are barriers, stalls every peer. Adopt
+    # rank 0's tactics everywhere.
+    tuner = AutoTuner.get()
+    payload: list[str | None] = [None]
+    if dist.get_rank() == 0:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "moe_tactics.json")
+            tuner.save_configs(path)
+            with open(path, encoding="utf-8") as handle:
+                payload[0] = handle.read()
+    dist.broadcast_object_list(payload, src=0, group=sync_group)
+    if dist.get_rank() != 0:
+        configs = payload[0]
+        if not configs:
+            raise RuntimeError("rank 0 produced no autotuner configs to broadcast")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "moe_tactics.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(configs)
+            # Live tuning results take priority over loaded ones, so this rank
+            # has to drop its own picks before adopting rank 0's.
+            tuner.clear_cache()
+            if not tuner.load_configs(path):
+                raise RuntimeError(
+                    "failed to load autotuner configs broadcast from rank 0; "
+                    "ranks may differ in GPU or library versions"
+                )
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
@@ -603,6 +648,16 @@ def reduce_min_max(
     dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
     return minimum.cpu().tolist(), maximum.cpu().tolist()
+
+
+def gather_per_rank(values: list[float], device: torch.device) -> list[list[float]]:
+    world_size = dist.get_world_size()
+    local = torch.tensor(values, dtype=torch.float64, device=device)
+    gathered = torch.empty(
+        (world_size, local.numel()), dtype=torch.float64, device=device
+    )
+    dist.all_gather_into_tensor(gathered, local)
+    return gathered.cpu().tolist()
 
 
 def synchronize_stream_and_ranks(
@@ -867,6 +922,7 @@ def profile_graph_replays(
     ]
     dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(local_stages, device)
     lo, hi = reduce_min_max(local_stages, device)
+    per_rank = gather_per_rank(local_stages, device)
     if dist.get_rank() == 0:
         print(
             "Torch Profiler CUDA kernel time per MoE iteration: "
@@ -882,6 +938,7 @@ def profile_graph_replays(
             f"sum={lo[3]:.1f}..{hi[3]:.1f}us (spread {hi[3] - lo[3]:.1f})",
             flush=True,
         )
+        print_per_rank_stages(per_rank)
         print_kernel_table(kernel_stats, local_timing)
     return Timing(
         dispatch_us=dispatch_us,
@@ -889,6 +946,26 @@ def profile_graph_replays(
         combine_us=combine_us,
         e2e_us=e2e_us,
     )
+
+
+def print_per_rank_stages(per_rank: list[list[float]]) -> None:
+    local_world_size = int(
+        os.environ.get("LOCAL_WORLD_SIZE", str(dist.get_world_size()))
+    )
+    rows = [["rank", "node", "dispatch", "MoE", "combine", "sum"]]
+    for rank, (dispatch, moe, combine, total) in enumerate(per_rank):
+        rows.append(
+            [
+                str(rank),
+                str(rank // local_world_size),
+                f"{dispatch:.1f}",
+                f"{moe:.1f}",
+                f"{combine:.1f}",
+                f"{total:.1f}",
+            ]
+        )
+    print("\nPer-rank stage time per MoE iteration (us):", flush=True)
+    print(format_markdown_table(rows), flush=True)
 
 
 def print_kernel_table(kernel_stats: list[KernelStat], timing: Timing) -> None:
@@ -999,7 +1076,8 @@ def main() -> None:
                 f"graph_replays={args.graph_replays}, "
                 f"iters_per_graph={args.iters_per_graph}, "
                 f"torch_profiler={args.torch_profiler}, "
-                f"moe_autotune={not args.skip_moe_autotune}\n"
+                f"moe_autotune={not args.skip_moe_autotune}"
+                f"{'' if args.skip_moe_autotune else (' (per-rank)' if args.per_rank_moe_autotune else ' (shared from rank 0)')}\n"
                 f"Versions: {versions}\n"
                 f"Rank-local expert weights: {weight_gib:.2f} GiB\n"
                 "Reported times are averaged across ranks.\n",
@@ -1056,6 +1134,7 @@ def main() -> None:
                     inputs=input_samples[0],
                     dispatched_tokens=world_size * num_tokens,
                     sync_group=cpu_group,
+                    per_rank=args.per_rank_moe_autotune,
                 )
 
             for inputs in input_samples:
