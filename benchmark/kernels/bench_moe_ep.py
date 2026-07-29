@@ -595,6 +595,16 @@ def reduce_mean(values: list[float], device: torch.device) -> list[float]:
     return tensor.cpu().tolist()
 
 
+def reduce_min_max(
+    values: list[float], device: torch.device
+) -> tuple[list[float], list[float]]:
+    minimum = torch.tensor(values, dtype=torch.float64, device=device)
+    maximum = minimum.clone()
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return minimum.cpu().tolist(), maximum.cpu().tolist()
+
+
 def synchronize_stream_and_ranks(
     mscclpp_comm_group: Any | None,
     cpu_group: dist.ProcessGroup,
@@ -849,20 +859,27 @@ def profile_graph_replays(
 
     dist.barrier(group=sync_group)
     local_timing, kernel_stats = summarize_profiled_replays(profiler, replays)
-    dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(
-        [
-            local_timing.dispatch_us,
-            local_timing.moe_us,
-            local_timing.combine_us,
-            local_timing.e2e_us,
-        ],
-        device,
-    )
+    local_stages = [
+        local_timing.dispatch_us,
+        local_timing.moe_us,
+        local_timing.combine_us,
+        local_timing.e2e_us,
+    ]
+    dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(local_stages, device)
+    lo, hi = reduce_min_max(local_stages, device)
     if dist.get_rank() == 0:
         print(
             "Torch Profiler CUDA kernel time per MoE iteration: "
             f"dispatch={dispatch_us:.1f}us, MoE={moe_us:.1f}us, "
             f"combine={combine_us:.1f}us, sum={e2e_us:.1f}us",
+            flush=True,
+        )
+        print(
+            "Per-rank spread (min .. max across ranks): "
+            f"dispatch={lo[0]:.1f}..{hi[0]:.1f}us (spread {hi[0] - lo[0]:.1f}), "
+            f"MoE={lo[1]:.1f}..{hi[1]:.1f}us (spread {hi[1] - lo[1]:.1f}), "
+            f"combine={lo[2]:.1f}..{hi[2]:.1f}us (spread {hi[2] - lo[2]:.1f}), "
+            f"sum={lo[3]:.1f}..{hi[3]:.1f}us (spread {hi[3] - lo[3]:.1f})",
             flush=True,
         )
         print_kernel_table(kernel_stats, local_timing)
