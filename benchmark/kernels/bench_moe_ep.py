@@ -716,10 +716,18 @@ def classify_profiled_kernel(name: str) -> str | None:
     return None
 
 
+@dataclass
+class KernelStat:
+    stage: str
+    name: str
+    launches_per_replay: float
+    total_us_per_replay: float
+
+
 def summarize_profiled_replays(
     profiler: torch.profiler.profile,
     expected_replays: int,
-) -> Timing:
+) -> tuple[Timing, list[KernelStat]]:
     events = profiler.events()
     launch_ids = [event.id for event in events if event.name == "cudaGraphLaunch"]
     if len(launch_ids) != expected_replays:
@@ -740,6 +748,7 @@ def summarize_profiled_replays(
             kernels_by_launch[event.id].append(event)
 
     replay_times: list[Timing] = []
+    kernel_totals: dict[tuple[str, str], list[float]] = {}
     for launch_id in launch_ids:
         stage_times = {"dispatch": 0.0, "moe": 0.0, "combine": 0.0}
         kernels = sorted(
@@ -770,6 +779,9 @@ def summarize_profiled_replays(
                 else ("combine" if index >= combine_begin else "moe")
             )
             stage_times[stage] += float(event.self_device_time_total)
+            entry = kernel_totals.setdefault((stage, event.name), [0.0, 0.0])
+            entry[0] += 1.0
+            entry[1] += float(event.self_device_time_total)
         replay_times.append(
             Timing(
                 dispatch_us=stage_times["dispatch"],
@@ -780,12 +792,26 @@ def summarize_profiled_replays(
         )
 
     count = len(replay_times)
-    return Timing(
+    stage_order = {"dispatch": 0, "moe": 1, "combine": 2}
+    kernel_stats = [
+        KernelStat(
+            stage=stage,
+            name=name,
+            launches_per_replay=totals[0] / count,
+            total_us_per_replay=totals[1] / count,
+        )
+        for (stage, name), totals in kernel_totals.items()
+    ]
+    kernel_stats.sort(
+        key=lambda stat: (stage_order[stat.stage], -stat.total_us_per_replay)
+    )
+    timing = Timing(
         dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
         moe_us=sum(item.moe_us for item in replay_times) / count,
         combine_us=sum(item.combine_us for item in replay_times) / count,
         e2e_us=sum(item.e2e_us for item in replay_times) / count,
     )
+    return timing, kernel_stats
 
 
 def profile_graph_replays(
@@ -812,7 +838,7 @@ def profile_graph_replays(
         torch.cuda.synchronize()
 
     dist.barrier(group=sync_group)
-    local_timing = summarize_profiled_replays(profiler, replays)
+    local_timing, kernel_stats = summarize_profiled_replays(profiler, replays)
     dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(
         [
             local_timing.dispatch_us,
@@ -829,12 +855,35 @@ def profile_graph_replays(
             f"combine={combine_us:.1f}us, sum={e2e_us:.1f}us",
             flush=True,
         )
+        print_kernel_table(kernel_stats, local_timing)
     return Timing(
         dispatch_us=dispatch_us,
         moe_us=moe_us,
         combine_us=combine_us,
         e2e_us=e2e_us,
     )
+
+
+def print_kernel_table(kernel_stats: list[KernelStat], timing: Timing) -> None:
+    total = timing.e2e_us
+    rows = [["stage", "kernel", "launches/replay", "us/replay", "% of total"]]
+    for stat in kernel_stats:
+        share = 100.0 * stat.total_us_per_replay / total if total > 0 else 0.0
+        rows.append(
+            [
+                stat.stage,
+                stat.name,
+                f"{stat.launches_per_replay:.1f}",
+                f"{stat.total_us_per_replay:.2f}",
+                f"{share:.1f}",
+            ]
+        )
+    print(
+        "\nRank-0 per-kernel CUDA time inside one graph replay "
+        "(self device time, averaged over replays):",
+        flush=True,
+    )
+    print(format_markdown_table(rows), flush=True)
 
 
 def format_markdown_table(rows: list[list[str]]) -> str:
