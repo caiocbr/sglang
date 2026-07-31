@@ -53,6 +53,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     has_per_rank_fused_shared_slots,
+    is_mscclpp_ll_rank_major,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -165,10 +166,18 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
                 num_max_dispatch_tokens_per_rank=(
                     envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
                 ),
+                rank_major=is_mscclpp_ll_rank_major(),
             )
 
         from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPDispatcher
 
+        # HT uses this value only as an input bound, unlike LL where it sizes
+        # static dispatch buffers. Cover ordinary prefill and decode forwards
+        # even when the decode-oriented environment default is left at 128.
+        num_max_dispatch_tokens_per_rank = max(
+            envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
+            get_server_args().cutedsl_moe_max_num_tokens(),
+        )
         return MSCCLPPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -176,6 +185,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")

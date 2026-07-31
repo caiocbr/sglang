@@ -31,8 +31,12 @@ if TYPE_CHECKING:
         FlashinferDispatchOutput,
         MSCCLPPCombineInput,
         MSCCLPPDispatchOutput,
+        MSCCLPPExpertMajorLLCombineInput,
+        MSCCLPPExpertMajorLLDispatchOutput,
         MSCCLPPLLCombineInput,
         MSCCLPPLLDispatchOutput,
+        MSCCLPPRankMajorLLCombineInput,
+        MSCCLPPRankMajorLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -181,6 +185,18 @@ class DispatchOutputChecker:
     ) -> TypeGuard[MSCCLPPLLDispatchOutput]:
         return dispatch_output.format.is_mscclpp_ll()
 
+    @staticmethod
+    def format_is_mscclpp_ll_expert_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll_expert_major()
+
+    @staticmethod
+    def format_is_mscclpp_ll_rank_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPRankMajorLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll_rank_major()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -190,7 +206,8 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
     MSCCLPP = "mscclpp"
-    MSCCLPP_LL = "mscclpp_ll"
+    MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
+    MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -217,7 +234,16 @@ class DispatchOutputFormat(Enum):
         return self == DispatchOutputFormat.MSCCLPP
 
     def is_mscclpp_ll(self) -> bool:
-        return self == DispatchOutputFormat.MSCCLPP_LL
+        return self in [
+            DispatchOutputFormat.MSCCLPP_LL_EXPERT_MAJOR,
+            DispatchOutputFormat.MSCCLPP_LL_RANK_MAJOR,
+        ]
+
+    def is_mscclpp_ll_expert_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LL_EXPERT_MAJOR
+
+    def is_mscclpp_ll_rank_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LL_RANK_MAJOR
 
 
 @runtime_checkable
@@ -283,7 +309,22 @@ class CombineInputChecker:
     def format_is_mscclpp_ll(
         combine_input: CombineInput,
     ) -> TypeGuard[MSCCLPPLLCombineInput]:
-        return combine_input.format == CombineInputFormat.MSCCLPP_LL
+        return combine_input.format in [
+            CombineInputFormat.MSCCLPP_LL_EXPERT_MAJOR,
+            CombineInputFormat.MSCCLPP_LL_RANK_MAJOR,
+        ]
+
+    @staticmethod
+    def format_is_mscclpp_ll_expert_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LL_EXPERT_MAJOR
+
+    @staticmethod
+    def format_is_mscclpp_ll_rank_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPRankMajorLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LL_RANK_MAJOR
 
 
 class CombineInputFormat(Enum):
@@ -293,7 +334,8 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
     MSCCLPP = "mscclpp"
-    MSCCLPP_LL = "mscclpp_ll"
+    MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
+    MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 
 
 @runtime_checkable

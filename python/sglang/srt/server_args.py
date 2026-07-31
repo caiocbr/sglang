@@ -5921,8 +5921,8 @@ class ServerArgs:
             )
         if self.moe_a2a_backend == "flashinfer":
             assert (
-                resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
-            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+                resolved_view(self).enable_dp_attention
+            ), "Flashinfer MoE A2A requires --enable-dp-attention"
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -7155,9 +7155,6 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Auto-derived from Annotated[..., Arg(...)] field metadata.
-        add_cli_args_from_dataclass(parser, ServerArgs)
-
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
@@ -7887,16 +7884,11 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
-            "--enable-deepep-waterfill",
+            "--enable-waterfill",
             action="store_true",
-            default=ServerArgs.enable_deepep_waterfill,
-            help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
-            "routed expert to the least-loaded EP rank. Automatically sets "
-            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
-            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
-            "or low_latency for production decode so CUDA graph remains enabled. "
-            "Supported on DeepSeek-V3/R1 "
-            "with EP >= 2.",
+            default=ServerArgs.enable_waterfill,
+            help="Enable Waterfill: dispatch the fused shared expert as an extra "
+            "routed expert slot to the least-loaded EP rank.",
         )
         parser.add_argument(
             "--elastic-ep-rejoin",
@@ -7927,10 +7919,10 @@ class ServerArgs:
             help="The ratio of mamba state memory to full kv cache memory.",
         )
         parser.add_argument(
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             type=str,
-            choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
-            default=ServerArgs.mamba_scheduler_strategy,
+            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            default=ServerArgs.mamba_radix_cache_strategy,
             help="The strategy to use for mamba radix cache.",
         )
         parser.add_argument(
@@ -8404,6 +8396,9 @@ class ServerArgs:
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
+
+        # Auto-derived from Annotated[..., Arg(...)] field metadata.
+        add_cli_args_from_dataclass(parser, ServerArgs)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -9268,7 +9263,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    parser = argparse.ArgumentParser(prog="sglang serve")
+    parser = argparse.ArgumentParser(prog="sglang serve", conflict_handler="resolve")
     ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present

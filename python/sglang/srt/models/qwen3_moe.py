@@ -44,6 +44,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    is_mscclpp_ll_rank_major,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -292,15 +293,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-
-        if (
-            not get_moe_a2a_backend().is_deepep()
-            and not get_moe_a2a_backend().is_ascend_fuseep()
-            and not get_moe_a2a_backend().is_mscclpp()
-        ):
-            return self.forward_normal(hidden_states)
-        else:
+        a2a_backend = get_moe_a2a_backend()
+        use_padding_aware_forward = (
+            a2a_backend.is_deepep()
+            or a2a_backend.is_ascend_fuseep()
+            or (a2a_backend.is_mscclpp() and not is_mscclpp_ll_rank_major())
+        )
+        if use_padding_aware_forward:
             return self.forward_deepep(hidden_states, forward_batch)
+        return self.forward_normal(hidden_states)
 
     def get_moe_weights(self):
         return [
