@@ -19,7 +19,9 @@ By default one CUDA Graph captures ``--iters-per-graph`` independently routed
 reported over ``--graph-replays`` replays. Capturing many iterations amortizes
 launch overhead and averages over routing variation. Pass ``--iters-per-graph 1``
 to match SGLang decode CUDA Graph boundaries, and add ``--torch-profiler`` to
-report per-stage CUDA kernel time instead of wall-clock time.
+report per-stage and per-kernel CUDA time instead of wall-clock time. Profiling
+honours ``--iters-per-graph``; keep it high so the spin-waiting dispatch and
+combine kernels are not inflated by per-replay launch skew.
 
 Example on one 8-GPU node:
 
@@ -34,6 +36,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -138,6 +141,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use FlashInfer CUTLASS fallback tactics instead of exact-shape autotuning.",
     )
+    parser.add_argument(
+        "--per-rank-moe-autotune",
+        action="store_true",
+        help="Autotune independently on every rank instead of broadcasting rank 0's "
+        "tactics. Ranks that mis-time a candidate become stragglers and, because "
+        "dispatch and combine are barriers, stall every peer.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--weight-std",
@@ -207,11 +217,6 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--warmup-replays must be non-negative")
     if args.iters_per_graph <= 0:
         raise ValueError("--iters-per-graph must be positive")
-    if args.torch_profiler and args.iters_per_graph != 1:
-        raise ValueError(
-            "--torch-profiler attributes kernels to one dispatch/MoE/combine "
-            "boundary, so it requires --iters-per-graph 1"
-        )
 
 
 def make_local_weights(
@@ -574,13 +579,50 @@ def autotune_moe(
     inputs: Inputs,
     dispatched_tokens: int,
     sync_group: dist.ProcessGroup,
+    per_rank: bool = False,
 ) -> None:
-    from flashinfer.autotuner import autotune
+    from flashinfer.autotuner import AutoTuner, autotune
 
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
+    # Tuning replays the whole pipeline, including the collective dispatch and
+    # combine, so every rank has to run the tuning pass in lockstep.
     with autotune(True, tuning_buckets=(dispatched_tokens,)):
         run_once(pipeline, inputs)
+    torch.cuda.synchronize()
+    dist.barrier(group=sync_group)
+    if per_rank:
+        return
+
+    # Every rank tunes the same shapes, so independent picks only add noise: a
+    # rank that mis-times one candidate keeps a slower tactic for the whole run
+    # and, because dispatch and combine are barriers, stalls every peer. Adopt
+    # rank 0's tactics everywhere.
+    tuner = AutoTuner.get()
+    payload: list[str | None] = [None]
+    if dist.get_rank() == 0:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "moe_tactics.json")
+            tuner.save_configs(path)
+            with open(path, encoding="utf-8") as handle:
+                payload[0] = handle.read()
+    dist.broadcast_object_list(payload, src=0, group=sync_group)
+    if dist.get_rank() != 0:
+        configs = payload[0]
+        if not configs:
+            raise RuntimeError("rank 0 produced no autotuner configs to broadcast")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "moe_tactics.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(configs)
+            # Live tuning results take priority over loaded ones, so this rank
+            # has to drop its own picks before adopting rank 0's.
+            tuner.clear_cache()
+            if not tuner.load_configs(path):
+                raise RuntimeError(
+                    "failed to load autotuner configs broadcast from rank 0; "
+                    "ranks may differ in GPU or library versions"
+                )
     torch.cuda.synchronize()
     dist.barrier(group=sync_group)
 
@@ -596,6 +638,26 @@ def reduce_mean(values: list[float], device: torch.device) -> list[float]:
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= dist.get_world_size()
     return tensor.cpu().tolist()
+
+
+def reduce_min_max(
+    values: list[float], device: torch.device
+) -> tuple[list[float], list[float]]:
+    minimum = torch.tensor(values, dtype=torch.float64, device=device)
+    maximum = minimum.clone()
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return minimum.cpu().tolist(), maximum.cpu().tolist()
+
+
+def gather_per_rank(values: list[float], device: torch.device) -> list[list[float]]:
+    world_size = dist.get_world_size()
+    local = torch.tensor(values, dtype=torch.float64, device=device)
+    gathered = torch.empty(
+        (world_size, local.numel()), dtype=torch.float64, device=device
+    )
+    dist.all_gather_into_tensor(gathered, local)
+    return gathered.cpu().tolist()
 
 
 def synchronize_stream_and_ranks(
@@ -716,10 +778,18 @@ def classify_profiled_kernel(name: str) -> str | None:
     return None
 
 
+@dataclass
+class KernelStat:
+    stage: str
+    name: str
+    launches_per_iteration: float
+    total_us_per_iteration: float
+
+
 def summarize_profiled_replays(
     profiler: torch.profiler.profile,
     expected_replays: int,
-) -> Timing:
+) -> tuple[Timing, list[KernelStat]]:
     events = profiler.events()
     launch_ids = [event.id for event in events if event.name == "cudaGraphLaunch"]
     if len(launch_ids) != expected_replays:
@@ -740,52 +810,83 @@ def summarize_profiled_replays(
             kernels_by_launch[event.id].append(event)
 
     replay_times: list[Timing] = []
+    kernel_totals: dict[tuple[str, str], list[float]] = {}
+    iterations_seen: list[int] = []
     for launch_id in launch_ids:
         stage_times = {"dispatch": 0.0, "moe": 0.0, "combine": 0.0}
         kernels = sorted(
             kernels_by_launch[launch_id],
             key=lambda event: (event.time_range.start, event.time_range.end),
         )
-        markers = [classify_profiled_kernel(event.name) for event in kernels]
-        dispatch_indices = [
-            index for index, marker in enumerate(markers) if marker == "dispatch"
-        ]
-        combine_indices = [
-            index for index, marker in enumerate(markers) if marker == "combine"
-        ]
-        if not dispatch_indices or not combine_indices:
-            kernel_names = "\n".join(f"  {event.name}" for event in kernels)
+        # A graph may contain many dispatch -> MoE -> combine iterations, so
+        # walk the kernels as a state machine instead of assuming one boundary
+        # pair. An unclassified kernel belongs to MoE only when it follows
+        # dispatch; anything after combine starts the next iteration.
+        stage = None
+        iterations = 0
+        for event in kernels:
+            marker = classify_profiled_kernel(event.name)
+            if marker == "dispatch":
+                if stage != "dispatch":
+                    iterations += 1
+                stage = "dispatch"
+            elif marker == "combine":
+                stage = "combine"
+            elif stage == "dispatch":
+                stage = "moe"
+            elif stage is None:
+                kernel_names = "\n".join(f"  {item.name}" for item in kernels)
+                raise RuntimeError(
+                    "Torch Profiler saw a kernel before any dispatch kernel in "
+                    f"a graph replay:\n{kernel_names}"
+                )
+            stage_times[stage] += float(event.self_device_time_total)
+            entry = kernel_totals.setdefault((stage, event.name), [0.0, 0.0])
+            entry[0] += 1.0
+            entry[1] += float(event.self_device_time_total)
+        if iterations == 0 or stage != "combine":
+            kernel_names = "\n".join(f"  {item.name}" for item in kernels)
             raise RuntimeError(
                 "Torch Profiler could not identify dispatch/combine boundaries "
                 f"for a graph replay:\n{kernel_names}"
             )
-        dispatch_end = max(dispatch_indices)
-        combine_begin = min(combine_indices)
-        if dispatch_end + 1 >= combine_begin:
-            raise RuntimeError("profiled dispatch, MoE, and combine kernels overlap")
-        for index, event in enumerate(kernels):
-            stage = (
-                "dispatch"
-                if index <= dispatch_end
-                else ("combine" if index >= combine_begin else "moe")
-            )
-            stage_times[stage] += float(event.self_device_time_total)
+        iterations_seen.append(iterations)
         replay_times.append(
             Timing(
-                dispatch_us=stage_times["dispatch"],
-                moe_us=stage_times["moe"],
-                combine_us=stage_times["combine"],
-                e2e_us=sum(stage_times.values()),
+                dispatch_us=stage_times["dispatch"] / iterations,
+                moe_us=stage_times["moe"] / iterations,
+                combine_us=stage_times["combine"] / iterations,
+                e2e_us=sum(stage_times.values()) / iterations,
             )
         )
 
+    if len(set(iterations_seen)) != 1:
+        raise RuntimeError(
+            f"graph replays contained differing iteration counts: {sorted(set(iterations_seen))}"
+        )
+
     count = len(replay_times)
-    return Timing(
+    samples = count * iterations_seen[0]
+    stage_order = {"dispatch": 0, "moe": 1, "combine": 2}
+    kernel_stats = [
+        KernelStat(
+            stage=stage,
+            name=name,
+            launches_per_iteration=totals[0] / samples,
+            total_us_per_iteration=totals[1] / samples,
+        )
+        for (stage, name), totals in kernel_totals.items()
+    ]
+    kernel_stats.sort(
+        key=lambda stat: (stage_order[stat.stage], -stat.total_us_per_iteration)
+    )
+    timing = Timing(
         dispatch_us=sum(item.dispatch_us for item in replay_times) / count,
         moe_us=sum(item.moe_us for item in replay_times) / count,
         combine_us=sum(item.combine_us for item in replay_times) / count,
         e2e_us=sum(item.e2e_us for item in replay_times) / count,
     )
+    return timing, kernel_stats
 
 
 def profile_graph_replays(
@@ -812,29 +913,81 @@ def profile_graph_replays(
         torch.cuda.synchronize()
 
     dist.barrier(group=sync_group)
-    local_timing = summarize_profiled_replays(profiler, replays)
-    dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(
-        [
-            local_timing.dispatch_us,
-            local_timing.moe_us,
-            local_timing.combine_us,
-            local_timing.e2e_us,
-        ],
-        device,
-    )
+    local_timing, kernel_stats = summarize_profiled_replays(profiler, replays)
+    local_stages = [
+        local_timing.dispatch_us,
+        local_timing.moe_us,
+        local_timing.combine_us,
+        local_timing.e2e_us,
+    ]
+    dispatch_us, moe_us, combine_us, e2e_us = reduce_mean(local_stages, device)
+    lo, hi = reduce_min_max(local_stages, device)
+    per_rank = gather_per_rank(local_stages, device)
     if dist.get_rank() == 0:
         print(
-            "Torch Profiler CUDA kernel time per graph replay: "
+            "Torch Profiler CUDA kernel time per MoE iteration: "
             f"dispatch={dispatch_us:.1f}us, MoE={moe_us:.1f}us, "
             f"combine={combine_us:.1f}us, sum={e2e_us:.1f}us",
             flush=True,
         )
+        print(
+            "Per-rank spread (min .. max across ranks): "
+            f"dispatch={lo[0]:.1f}..{hi[0]:.1f}us (spread {hi[0] - lo[0]:.1f}), "
+            f"MoE={lo[1]:.1f}..{hi[1]:.1f}us (spread {hi[1] - lo[1]:.1f}), "
+            f"combine={lo[2]:.1f}..{hi[2]:.1f}us (spread {hi[2] - lo[2]:.1f}), "
+            f"sum={lo[3]:.1f}..{hi[3]:.1f}us (spread {hi[3] - lo[3]:.1f})",
+            flush=True,
+        )
+        print_per_rank_stages(per_rank)
+        print_kernel_table(kernel_stats, local_timing)
     return Timing(
         dispatch_us=dispatch_us,
         moe_us=moe_us,
         combine_us=combine_us,
         e2e_us=e2e_us,
     )
+
+
+def print_per_rank_stages(per_rank: list[list[float]]) -> None:
+    local_world_size = int(
+        os.environ.get("LOCAL_WORLD_SIZE", str(dist.get_world_size()))
+    )
+    rows = [["rank", "node", "dispatch", "MoE", "combine", "sum"]]
+    for rank, (dispatch, moe, combine, total) in enumerate(per_rank):
+        rows.append(
+            [
+                str(rank),
+                str(rank // local_world_size),
+                f"{dispatch:.1f}",
+                f"{moe:.1f}",
+                f"{combine:.1f}",
+                f"{total:.1f}",
+            ]
+        )
+    print("\nPer-rank stage time per MoE iteration (us):", flush=True)
+    print(format_markdown_table(rows), flush=True)
+
+
+def print_kernel_table(kernel_stats: list[KernelStat], timing: Timing) -> None:
+    total = timing.e2e_us
+    rows = [["stage", "kernel", "launches/iter", "us/iter", "% of total"]]
+    for stat in kernel_stats:
+        share = 100.0 * stat.total_us_per_iteration / total if total > 0 else 0.0
+        rows.append(
+            [
+                stat.stage,
+                stat.name,
+                f"{stat.launches_per_iteration:.1f}",
+                f"{stat.total_us_per_iteration:.2f}",
+                f"{share:.1f}",
+            ]
+        )
+    print(
+        "\nRank-0 per-kernel CUDA time per MoE iteration "
+        "(self device time, averaged over all profiled iterations):",
+        flush=True,
+    )
+    print(format_markdown_table(rows), flush=True)
 
 
 def format_markdown_table(rows: list[list[str]]) -> str:
@@ -923,7 +1076,8 @@ def main() -> None:
                 f"graph_replays={args.graph_replays}, "
                 f"iters_per_graph={args.iters_per_graph}, "
                 f"torch_profiler={args.torch_profiler}, "
-                f"moe_autotune={not args.skip_moe_autotune}\n"
+                f"moe_autotune={not args.skip_moe_autotune}"
+                f"{'' if args.skip_moe_autotune else (' (per-rank)' if args.per_rank_moe_autotune else ' (shared from rank 0)')}\n"
                 f"Versions: {versions}\n"
                 f"Rank-local expert weights: {weight_gib:.2f} GiB\n"
                 "Reported times are averaged across ranks.\n",
@@ -980,6 +1134,7 @@ def main() -> None:
                     inputs=input_samples[0],
                     dispatched_tokens=world_size * num_tokens,
                     sync_group=cpu_group,
+                    per_rank=args.per_rank_moe_autotune,
                 )
 
             for inputs in input_samples:
