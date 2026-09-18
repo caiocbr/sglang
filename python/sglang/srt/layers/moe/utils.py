@@ -291,12 +291,27 @@ class MSCCLPPMode(Enum):
 
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
+    AUTO = "auto"
+
+    def enable_normal(self) -> bool:
+        return self in (MSCCLPPMode.NORMAL, MSCCLPPMode.AUTO)
+
+    def enable_low_latency(self) -> bool:
+        return self in (MSCCLPPMode.LOW_LATENCY, MSCCLPPMode.AUTO)
+
+    def resolve(self, is_extend_in_batch: bool) -> MSCCLPPMode:
+        if self != MSCCLPPMode.AUTO:
+            return self
+        return MSCCLPPMode.NORMAL if is_extend_in_batch else MSCCLPPMode.LOW_LATENCY
 
     def is_normal(self) -> bool:
         return self == MSCCLPPMode.NORMAL
 
     def is_low_latency(self) -> bool:
         return self == MSCCLPPMode.LOW_LATENCY
+
+    def is_auto(self) -> bool:
+        return self == MSCCLPPMode.AUTO
 
 
 class DispatcherOutputDtype(Enum):
@@ -624,15 +639,15 @@ def get_deepep_mode() -> DeepEPMode:
 def get_mscclpp_mode() -> MSCCLPPMode:
     moe = get_flags().moe
     if moe.mscclpp_mode is None:
-        logger.warning("MSCCLPP_MODE is not initialized, using normal mode")
-        moe.mscclpp_mode = MSCCLPPMode.NORMAL
+        logger.warning("MSCCLPP_MODE is not initialized, using auto mode")
+        moe.mscclpp_mode = MSCCLPPMode.AUTO
     return moe.mscclpp_mode
 
 
 def is_mscclpp_ll_rank_major() -> bool:
     return (
         get_moe_a2a_backend().is_mscclpp()
-        and get_mscclpp_mode().is_low_latency()
+        and get_mscclpp_mode().enable_low_latency()
         and get_moe_runner_backend().is_flashinfer_cutlass()
     )
 

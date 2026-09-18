@@ -41,6 +41,10 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+    MSCCLPPDispatcher,
+    MSCCLPPOutputLayout,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -222,37 +226,6 @@ def create_moe_dispatcher(
             moe_runner_config=moe_runner_config,
         )
     elif a2a_backend.is_mscclpp():
-        # Single ``mscclpp`` a2a backend, two transport modes (mirrors DeepEP):
-        #   normal       -> high-throughput intranode (NVLink) dispatcher
-        #   low_latency  -> low-latency (LL) dispatcher
-        if get_mscclpp_mode().is_low_latency():
-            from sglang.srt.environ import envs
-            from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-                MSCCLPPLLDispatcher,
-            )
-
-            return MSCCLPPLLDispatcher(
-                group=get_tp_group().device_group,
-                router_topk=moe_runner_config.top_k,
-                num_experts=moe_runner_config.num_experts,
-                num_local_experts=moe_runner_config.num_local_experts,
-                hidden_size=moe_runner_config.hidden_size,
-                params_dtype=moe_runner_config.params_dtype,
-                num_max_dispatch_tokens_per_rank=(
-                    envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-                ),
-                rank_major=is_mscclpp_ll_rank_major(),
-            )
-
-        from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPDispatcher
-
-        # HT uses this value only as an input bound, unlike LL where it sizes
-        # static dispatch buffers. Cover ordinary prefill and decode forwards
-        # even when the decode-oriented environment default is left at 128.
-        num_max_dispatch_tokens_per_rank = max(
-            envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
-            get_server_args().cutedsl_moe_max_num_tokens(),
-        )
         return MSCCLPPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -260,7 +233,12 @@ def create_moe_dispatcher(
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
-            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            mscclpp_mode=get_mscclpp_mode(),
+            output_layout=(
+                MSCCLPPOutputLayout.RANK_MAJOR
+                if is_mscclpp_ll_rank_major()
+                else MSCCLPPOutputLayout.EXPERT_MAJOR
+            ),
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
